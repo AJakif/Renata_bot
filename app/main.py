@@ -23,6 +23,11 @@ DOCS_DIR = Path(__file__).parent.parent / "docs"
 CHROMA_DIR = Path(__file__).parent.parent / "chroma_db"
 STATIC_DIR = Path(__file__).parent.parent / "static"
 TOP_K: int = int(os.getenv("TOP_K", "5"))
+CONTEXTUAL_HEADERS: bool = os.getenv("CONTEXTUAL_HEADERS", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 # Structural invariant checked at startup: every document must yield exactly
 # one overview chunk plus six numbered sections. The total is derived from the
@@ -99,7 +104,13 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
         _product_infos.append(extract_product_info(doc_chunks))
     _assert_chunks_valid(chunks, pdf_paths)
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    _collection = build_collection(chunks, client)
+    product_infos_by_source = {pi.source: pi for pi in _product_infos}
+    _collection = build_collection(
+        chunks,
+        client,
+        product_infos_by_source,
+        use_contextual_headers=CONTEXTUAL_HEADERS,
+    )
     yield
     _collection = None
     _product_infos.clear()
