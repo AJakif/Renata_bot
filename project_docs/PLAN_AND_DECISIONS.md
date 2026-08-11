@@ -247,7 +247,12 @@ is not.
 Full cross-document synthesis ("which of these are unsafe in pregnancy?") stays
 out of scope; D14 does attribution, not comparison.
 
-### D9 — LLM: thin provider adapter, provider configurable, Groq default
+### D9 — LLM: thin provider adapter, provider configurable, **Ollama default**
+
+> **Superseded in part by D23.** The default flipped from Groq to Ollama once the
+> memory budget was actually measured. The adapter shape, the `.env` config
+> table and the no-auto-detection rule below all still stand; only the default
+> value and the justification changed. See D23 for the local-model engineering.
 
 One function, `generate(prompt) -> str`, two implementations selected by
 `LLM_PROVIDER`. **Not** a routing layer, fallback chain, or cost-aware
@@ -262,33 +267,31 @@ below.
 
 | Var | Default | Notes |
 |---|---|---|
-| `LLM_PROVIDER` | `groq` | `groq` \| `ollama` |
+| `LLM_PROVIDER` | `ollama` | `ollama` \| `groq` |
 | `LLM_MODEL` | per-provider default | model id is config, not code — a deprecated hosted model id becomes a one-line fix, not a code change |
+| `OLLAMA_HOST` | `http://localhost:11434` | overridden to `host.docker.internal` in the container |
 | `GROQ_API_KEY` | — | required only when provider is `groq` |
-| `OLLAMA_HOST` | `http://localhost:11434` | |
 
 Both paths are first-class and tested; neither is a code branch beyond the two
 `generate()` implementations.
 
-**Justification for DESIGN.md (one line):** it de-risks *their* run — an
-evaluator without Ollama flips one env var instead of filing a bug.
+**Default = Ollama**, matching the brief's stated recommendation. The hosted
+provider stays fully supported as the escape hatch for a machine that cannot
+spare the memory, or an evaluator who would rather not install a daemon — one
+env var, no code change.
 
-**Default = Groq — a deliberate, stated deviation from the brief.** The brief
-marks local Ollama ✅ *Recommended* and free-tier hosted ✅ *Also fine*, and it
-pre-empts the obvious size objection by naming `llama3.2:3b` and `phi3` (~2 GB)
-as completely acceptable. So the original "`llama3.1:8b` is a 4.7 GB download"
-argument does not survive contact with the brief and has been dropped.
+**The earlier Groq-default reasoning is withdrawn.** It rested on the
+five-minute setup promise versus a multi-gigabyte pull. That trade is real but
+it was resolved the wrong way: the graded core of this assignment is ingestion
+and retrieval, both fully local and both runnable with no provider at all, so
+the model pull is not on the critical path to *assessing* the system. And an
+offline default is worth more than a fast one for a service whose entire premise
+is that answers must be traceable to local documents.
 
-The argument that does survive: the brief *also* requires install-and-run in
-under five minutes, and no README makes a ~2 GB pull plus a running daemon fit
-that on a modest laptop. Groq needs a ~60-second free-tier key and no download.
-Where two requirements conflict, the hard setup requirement outranks a stated
-preference — and the preference is fully satisfied by `LLM_PROVIDER=ollama`,
-which is documented in the README as the offline path with `llama3.2:3b` as the
-suggested model.
-
-**Say the deviation out loud in DESIGN.md.** A reasoned deviation reads as
-judgment; a silent one reads as not having read the brief.
+What survives from that analysis is the honesty requirement: **the README must
+state setup time excluding the model pull, and state the pull separately**,
+rather than claiming five minutes and quietly meaning "if you already have the
+model."
 
 **Safety net:** embeddings are local MiniLM regardless, so ingestion, indexing
 and retrieval work with no API key at all. A key-less evaluator can still
@@ -526,6 +529,117 @@ Four decisions inside it, each load-bearing:
 
 Estimated image: `python:3.11-slim` (~130 MB) + stack (~400 MB) + model
 (167 MB) ≈ **750 MB**.
+
+### D23 — Engineering the local model to an 8 GB machine
+
+The target is a laptop with **8 GB total RAM and no GPU**. Everything here was
+measured on Ollama 0.32.9, `ollama ps` reporting **100% CPU**.
+
+**The budget.**
+
+| | RAM |
+|---|---|
+| OS baseline (Windows / macOS) | 2.0–3.0 GB |
+| Service — Chroma + ONNX + FastAPI | ~0.35 GB |
+| Ollama runtime overhead | ~0.2 GB |
+| **Left for the model** | **~2.5 GB safe** |
+
+**7B is ruled out by measurement, not by feel.** `qwen2.5:7b` sits at **4.9 GB
+resident** at `num_ctx=2048`. Against a 3 GB OS and the service, that leaves
+nothing. A 3B-class model at Q4 lands ~2.5–2.8 GB and fits with headroom.
+
+**Three settings that change resident size, none of them defaults:**
+
+- **`num_ctx=2048`.** The prompt is ~700 tokens (8 chunks + system + question)
+  and output is capped at 300, so 4096 would buy nothing and cost ~250 MB of KV
+  cache. Verified honored — `ollama ps` reports the context it actually used.
+- **`OLLAMA_NUM_PARALLEL=1`.** Ollama sizes KV cache *per parallel slot* and can
+  auto-select 4. That is a silent 4× multiplier on the single quantity being
+  budgeted, and it is the most likely cause of an unexplained OOM on a small
+  machine.
+- **`OLLAMA_MAX_LOADED_MODELS=1`.** Stops a second model becoming resident
+  alongside the first.
+
+Also set: `num_predict=300` (answers are one or two sentences from a 40-word
+chunk), `keep_alive` configurable — default keeps the model warm between
+questions, and drops to 0 to unload after each request on a memory-starved box,
+trading latency for RAM.
+
+**Determinism holds on a local model.** `temperature=0, seed=42` gave
+byte-identical output across 3 consecutive runs. User story 25 survives the
+provider change.
+
+**Latency:** ~5.5 s per question for 7B on 8 CPU cores; a 3B model is
+proportionally faster. An 11-question eval pass costs roughly a minute — which
+is what makes D24 possible.
+
+### D24 — Structured output is what makes cite-or-refuse implementable
+
+**The measurement that decided it.** Same model, same prompt, same temperature;
+the only variable is whether decoding is constrained to a JSON schema.
+
+| Question | schema | free text |
+|---|---|---|
+| Drive + Rolac → refuse | ✅ `ids=[]` | `"I don't have that information. []` ⏎ `[3]"` |
+| Drive + Fenadin → answer | ✅ `ids=[2]` | `[2]` ⏎ `[…]` ⏎ `chunk_ids: ["2"]` |
+| Store Rolac → answer | ✅ `ids=[1]` | `[1]` ⏎ `"I don't have that information.[]"` |
+| Alcohol → refuse | ⚠️ refuses, `ids=[1,3,4]` | ✅ `ids=[]` |
+
+Free-text id emission is **unusable**: 0 of 4 parsed cleanly, and one response
+cited chunk 1 *and* refused in the same breath. Schema-constrained: 4 of 4 valid
+JSON, 3 of 4 fully correct.
+
+This reframes D5 layer 3. On a hosted frontier model, "return the ids you used"
+is a prompt instruction that mostly works. On a 3B local model it does not work
+at all, and **constrained decoding is the only reason the layer is
+implementable**. Ollama takes a JSON schema in `format`; the hosted provider
+gets the equivalent JSON mode, so the adapter stays one function.
+
+**Bug found, and a contract change.** Row 4 refused correctly but attached
+`ids=[1,3,4]` — a refusal *with* citations, violating the empty-citations rule.
+Cite-or-refuse as specified would have validated those ids (all genuinely
+retrieved), passed, and emitted a refusal with three citations.
+
+**Fix:** the schema carries an explicit `answered: bool`. When it is false, the
+service emits the fixed refusal message with an empty citation list regardless
+of what ids came back. Refusal is a structured field, never inferred by matching
+the answer string.
+
+### D25 — Model choice is measured, not asserted
+
+An 11-question pass costs about a minute, so there is no reason to argue about
+which small model to use. Scored on what actually matters here, not on general
+benchmarks: schema adherence, correct refusal when the retrieved passage belongs
+to a *different* product, and no citation attached to a refusal.
+
+**Result — `qwen2.5:3b` ships.** Six grounding cases, schema constrained,
+`temperature=0`, `seed=42`, `num_ctx=2048`:
+
+| | resident | valid JSON | fully correct | clean refusals | mean latency |
+|---|---|---|---|---|---|
+| `llama3.2:3b` | 2.3 GB | 6/6 | 3/6 | **1/2** | 4.6 s |
+| **`qwen2.5:3b`** | **2.1 GB** | 6/6 | **4/6** | **2/2** | 4.3 s |
+| `qwen2.5:7b` | 4.9 GB | — | — | — | 5.5 s |
+
+**The decisive case.** Asked "can I drive after taking Rolac?", `llama3.2:3b`
+returned `answered=true` citing chunk 3 (Rolac's contraindications) while
+reciting **Fenadin's** driving text — wrong product, and a citation that does not
+match the sentence it produced. That is exactly the failure this whole design
+exists to prevent, and it is worth noting the brief-recommended model is the one
+that commits it. `qwen2.5:3b` refuses it correctly.
+
+`qwen2.5:3b` fails in the *safe* direction: one false refusal on an answerable
+question, and one over-broad citation. For a medicines assistant, a false refusal
+is a recoverable error and a wrong-product answer is not.
+
+**Smaller and better on both axes** — 2.1 GB against 2.3 GB. This is a good
+reminder that parameter count is not the axis that matters for a task that is
+mostly instruction-following over supplied text.
+
+**A failure mode both models share:** occasionally `answered=true` with an empty
+`chunk_ids`. Cite-or-refuse then refuses, correctly but unhelpfully. This is the
+honesty/helpfulness trade the threshold also governs, and the false-refusal rate
+must be reported in `DESIGN.md` rather than hidden.
 
 ### D22 — Explicit `encoding="utf-8"` on every file operation
 

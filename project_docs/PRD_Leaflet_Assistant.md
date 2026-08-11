@@ -270,21 +270,41 @@ The whole stack must fit a modest laptop: ~370 MB installed, well under 400 MB
 resident with the hosted provider, comfortable at 4 GB RAM.
 
 Generation provider **and** model id are read from `.env` at startup, never
-hardcoded — a shipped `.env.example` documents both paths. Default is hosted
-free-tier; the local model is selected by changing one variable. Neither is a
+hardcoded — a shipped `.env.example` documents both paths. **Default is a local
+model**, matching the brief's recommendation; the hosted free-tier provider is
+the escape hatch for a machine that cannot spare the memory. Neither is a
 special case: the adapter is a single `generate(prompt) -> str` with two
 implementations, chosen by configuration, with **no runtime auto-detection** —
 a provider that varies by machine would contradict the determinism requirement.
 
-The hosted default is a deliberate, documented deviation from the brief, which
-recommends the local model. The two requirements conflict: install-and-run in
-under five minutes cannot absorb a multi-gigabyte model pull and a running
-daemon on a modest laptop, even at the ~2 GB sizes the brief names as
-acceptable. The hard setup requirement wins; the preference is satisfied by one
-environment variable.
+**Sizing to an 8 GB machine with no GPU.** The operating system takes 2–3 GB and
+the service ~350 MB, leaving roughly 2.5 GB for the model. A 7 B model measured
+at 4.9 GB resident and is therefore excluded; a 3 B model at 4-bit quantisation
+fits at ~2.1 GB. Three settings that are not defaults do the real work: the
+context window is pinned to 2048 (the prompt is around 700 tokens, so a larger
+window only wastes key-value cache), parallel request slots are pinned to one
+(the cache is sized *per slot* and can auto-select four, silently quadrupling
+the one quantity being budgeted), and only one model may be resident at a time.
 
-Embeddings and retrieval are fully local either way, so ingestion and retrieval
-can be verified with no API key at all.
+**Model selection is a measurement, not a preference.** Candidates are scored on
+the evaluation set for schema adherence, correct refusal when the retrieved
+passage belongs to a different product, and whether refusals arrive without
+citations attached. A full pass costs about a minute, so there is no reason to
+decide this by reputation. The result is recorded with the losing candidate's
+numbers alongside.
+
+**Generation is constrained to a JSON schema.** Requiring the model to name the
+passages it used is a prompt instruction that a frontier model mostly honours
+and a 3 B model does not honour at all — measured on identical prompts, free-text
+responses failed to parse in every case, and one cited a passage and refused in
+the same breath. Constrained decoding is what makes the cite-or-refuse layer
+implementable at this model size. The schema carries an explicit *answered*
+flag: refusal is a structured field, never inferred from the answer text, because
+a model did return a refusal with three citations attached.
+
+Embeddings and retrieval are fully local regardless, so ingestion, retrieval and
+the entire evaluation harness run with no model installed at all — the graded
+core can be assessed before anything is downloaded.
 
 ## Testing Decisions
 

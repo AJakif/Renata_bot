@@ -133,37 +133,86 @@ so the client needs no branching.
 |---|---|---|
 | Embeddings | `all-MiniLM-L6-v2`, **ONNX build** via ChromaDB | CPU, no key, deterministic, already a dependency — no torch, no `transformers`. ~370 MB total stack vs ~2.5 GB. Output is L2-normalized, so cosine is a dot product. Weak on domain pharma terms; acceptable since BM25 covers literal matches. |
 | Parsing | `pypdf`, `extraction_mode="layout"` | Pure Python, ~4 MB, no system binary. Verified to reproduce `pdftotext -layout` on the Maxpro dose table. |
-| Generation | Provider and model both from `.env`. Default `LLM_PROVIDER=groq`; `LLM_PROVIDER=ollama` («model») is the offline path. | Thin adapter — one `generate()`, not a routing layer and not auto-detecting. |
-| Temperature | 0 | Reproducible across runs. |
+| Generation | Ollama, `qwen2.5:3b`, from `.env`. `LLM_PROVIDER=groq` is the hosted escape hatch. | 2.1 GB resident, ~4.3 s/answer on CPU. Thin adapter — one `generate()`, not a routing layer and not auto-detecting. |
+| Decoding | `temperature=0`, `seed` fixed, **JSON schema constrained** | Byte-identical output across repeated runs, verified. |
 
-Embeddings and retrieval are **fully local** — ingestion and retrieval can be
-verified with no API key at all; only generation needs a provider.
+**The whole system is local.** Embeddings, retrieval and generation all run on
+CPU with no API key and no network. The hosted provider exists only for a
+machine that cannot spare the memory.
 
-**Deviation from the brief, stated deliberately.** The brief recommends a local
-Ollama model and lists free-tier hosted as also fine. This ships hosted as the
-*default* because the brief's five-minute install-and-run requirement and its
-LLM preference conflict on a modest laptop: even `llama3.2:3b` is a ~2 GB pull
-plus a running daemon. A hard setup requirement outranks a stated preference,
-and the preference is satisfied by one environment variable — the local path is
-documented in the README, not an afterthought. No auto-detection: a provider
-that varies by machine would undercut the reproducibility that `temperature=0`
-exists to guarantee.
+### Fitting an 8 GB machine
+
+Measured with `ollama ps` reporting 100% CPU — no GPU anywhere in this design.
+
+| | RAM |
+|---|---|
+| OS baseline | 2.0–3.0 GB |
+| Service — Chroma + ONNX + FastAPI | ~0.35 GB |
+| Ollama runtime | ~0.2 GB |
+| **Left for the model** | **~2.5 GB** |
+
+7B is ruled out by measurement: `qwen2.5:7b` is **4.9 GB resident**. A 3B model
+at Q4 lands ~2.6 GB and fits. Three non-default settings do the real work:
+`num_ctx=2048` (the prompt is ~700 tokens, so 4096 wastes ~250 MB of KV cache),
+`OLLAMA_NUM_PARALLEL=1` (KV cache is sized *per slot* and auto-selects up to 4 —
+a silent 4× on the one quantity being budgeted), and `OLLAMA_MAX_LOADED_MODELS=1`.
+
+**Model choice is measured, not argued** — a full pass costs about a minute, so
+both candidates were scored on grounding behaviour rather than benchmarks:
+
+| | resident | valid JSON | correct | clean refusals | latency |
+|---|---|---|---|---|---|
+| `llama3.2:3b` | 2.3 GB | 6/6 | 3/6 | 1/2 | 4.6 s |
+| **`qwen2.5:3b`** | **2.1 GB** | 6/6 | **4/6** | **2/2** | 4.3 s |
+
+Asked *"can I drive after taking Rolac?"*, `llama3.2:3b` answered from **Fenadin's**
+driving text while citing **Rolac's** contraindications chunk — the wrong-product
+failure this design is built against, produced by the model the brief recommends.
+`qwen2.5:3b` refuses it, and fails in the safe direction instead: one false
+refusal, one over-broad citation. Smaller *and* better on both axes.
+
+### Why the output is schema-constrained
+
+Layer 4 requires the model to return the ids of chunks it used. On a 3B local
+model, asking for that in prose **does not work** — measured on the same model
+and prompt with only the constraint varied, 0 of 4 free-text responses parsed,
+and one cited a chunk and refused in the same breath. Schema-constrained: 4 of 4
+valid, 3 of 4 fully correct. Constrained decoding is not a refinement here; it
+is what makes the grounding layer implementable at this model size.
+
+The schema carries an explicit `answered` boolean. When false, the service emits
+the fixed refusal with an empty citation list regardless of what ids came back —
+because a model *did* return a refusal with three citations attached, and
+inferring refusal by matching the answer string would have let it through.
 
 ## 6. Running it, and the hardware floor
 
-Two documented paths; the five-minute claim is measured for each, not asserted.
+Two documented paths. Setup time is measured for each, and the model pull is
+quoted **separately** rather than folded in — the honest number is more useful
+than a flattering one.
 
 | | pip + venv | Docker |
 |---|---|---|
-| Disk | ~370 MB | ~«750» MB image |
-| RSS, hosted LLM | ~«300» MB — fits 4 GB | same |
-| Cold start | «0.4» s | «0.4» s |
-| Setup time | «m:ss» | «m:ss» |
+| Disk, service | ~370 MB | ~«750» MB image |
+| Disk, model | 2.0 GB (`llama3.2:3b`) | same — lives on the host |
+| RSS, service | ~«300» MB | same |
+| RSS, service + model | ~«2.9» GB — **fits 8 GB** | same |
+| Setup, excluding model pull | «m:ss» | «m:ss» |
+| Model pull, one time | «m:ss» | «m:ss» |
+| Answer latency, CPU | «n» s | «n» s |
 
-The image bakes both the embedding model and the built index at build time, so a
-container starts ready and needs no network at runtime. Compose wires
-`host.docker.internal` so the Ollama path reaches a daemon on the host, including
-on Linux. Adding a leaflet needs no rebuild: mount `docs/` and run ingestion.
+The image bakes the embedding model and the built index, so a container starts
+ready and needs no network. **Ollama runs on the host, not in the container** —
+Compose maps `host.docker.internal` explicitly so this works on Linux as well as
+Docker Desktop. Keeping the language model out of the image avoids a second 2 GB
+copy in a volume, dodges Docker Desktop's own VM memory ceiling (the most likely
+silent failure on an 8 GB box), and lets the model stay warm across restarts.
+
+Adding a leaflet needs no rebuild: mount `docs/` and re-run ingestion.
+
+**The graded core needs no model at all.** Ingestion, retrieval and the entire
+evaluation harness run without Ollama installed, so the retrieval design can be
+assessed before anything is downloaded.
 
 ## 7. Evaluation
 
