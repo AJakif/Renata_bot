@@ -1,5 +1,6 @@
 """FastAPI application — POST /ask and static UI."""
 
+import logging
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -12,18 +13,32 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.generate import Generator, stub_generate
-from app.parser import parse_pdf
+from app.parser import Chunk, ProductInfo, extract_product_info, parse_pdf
 from app.retrieve import build_collection
 from app.retrieve import retrieve as _retrieve
+
+logger = logging.getLogger(__name__)
 
 DOCS_DIR = Path(__file__).parent.parent / "docs"
 CHROMA_DIR = Path(__file__).parent.parent / "chroma_db"
 STATIC_DIR = Path(__file__).parent.parent / "static"
 TOP_K: int = int(os.getenv("TOP_K", "5"))
 
+# Structural invariant checked at startup: every document must yield exactly
+# one overview chunk plus six numbered sections. The total is derived from the
+# number of PDFs actually found, not hardcoded, so dropping a new leaflet into
+# docs/ and restarting requires no code change (adding a doc changes doc count,
+# not this per-document invariant).
+_CHUNKS_PER_DOC = 7  # 1 overview + 6 numbered sections
+_EXPECTED_SECTIONS_PER_DOC = 6
+
 # Initialized during lifespan startup; overridable in tests via
 # app.dependency_overrides[get_collection].
 _collection: chromadb.Collection | None = None
+
+# Per-product brand/ingredient registry built at startup alongside the chunks.
+# Consumed by future issues (e.g. product-info endpoint); not served directly.
+_product_infos: list[ProductInfo] = []
 
 
 def get_collection() -> chromadb.Collection:
@@ -43,17 +58,51 @@ def get_generator() -> Generator:
     return stub_generate
 
 
+def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
+    """Raise RuntimeError if chunk count or per-document section coverage is wrong.
+
+    Called once at startup so a bad ingest prevents the app from serving stale
+    or incomplete data.  parse_pdf already validates each document individually;
+    this aggregates across all documents.
+    """
+    expected_total = len(pdf_paths) * _CHUNKS_PER_DOC
+    if len(chunks) != expected_total:
+        raise RuntimeError(
+            f"Startup assertion failed: expected {expected_total} total chunks "
+            f"({len(pdf_paths)} docs x {_CHUNKS_PER_DOC}), got {len(chunks)}.  "
+            "Check that all PDFs ingested correctly."
+        )
+    for pdf_path in pdf_paths:
+        fname = pdf_path.name
+        numbered = [c for c in chunks if c.source == fname and c.section != "Product overview"]
+        if len(numbered) != _EXPECTED_SECTIONS_PER_DOC:
+            raise RuntimeError(
+                f"Startup assertion failed: {fname} has {len(numbered)} numbered sections, "
+                f"expected {_EXPECTED_SECTIONS_PER_DOC}."
+            )
+    logger.info(
+        "Startup assertion passed: %d chunks across %d documents.",
+        len(chunks),
+        len(pdf_paths),
+    )
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     """Parse all PDFs in DOCS_DIR, embed them, and initialise the collection."""
-    global _collection
-    chunks = []
-    for pdf in sorted(DOCS_DIR.glob("*.pdf")):
-        chunks.extend(parse_pdf(pdf))
+    global _collection, _product_infos
+    chunks: list[Chunk] = []
+    pdf_paths = sorted(DOCS_DIR.glob("*.pdf"))
+    for pdf in pdf_paths:
+        doc_chunks = parse_pdf(pdf)
+        chunks.extend(doc_chunks)
+        _product_infos.append(extract_product_info(doc_chunks))
+    _assert_chunks_valid(chunks, pdf_paths)
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     _collection = build_collection(chunks, client)
     yield
     _collection = None
+    _product_infos.clear()
 
 
 app = FastAPI(title="Leaflet Assistant", lifespan=lifespan)
