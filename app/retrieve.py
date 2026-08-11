@@ -6,7 +6,7 @@ import chromadb
 import chromadb.api
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
-from app.parser import Chunk
+from app.parser import Chunk, ProductInfo
 
 COLLECTION_NAME = "leaflets"
 
@@ -17,13 +17,25 @@ class ChunkResult:
 
     source: str  # PDF filename including .pdf extension
     section: str  # Exact section heading
-    score: float  # Body-only cosine similarity ∈ [0, 1]
+    # Cosine similarity ∈ [0, 1] against the *indexed* vector — header+body when
+    # contextual headers are enabled, body-only otherwise. NOT yet the body-only
+    # gating score the architecture calls for; that split (dual embedding, D6 in
+    # PLAN_AND_DECISIONS.md) is a separate, not-yet-implemented slice.
+    score: float
     body: str  # Section text
+
+
+def _contextual_header(chunk: Chunk, product: ProductInfo) -> str:
+    """Return the header prepended to a chunk's embedding input when headers are enabled."""
+    return f"{product.brand} ({product.active_ingredient}) — {chunk.section}"
 
 
 def build_collection(
     chunks: list[Chunk],
     client: chromadb.api.ClientAPI,
+    product_infos: dict[str, ProductInfo] | None = None,
+    *,
+    use_contextual_headers: bool = True,
 ) -> chromadb.Collection:
     """Rebuild the Chroma collection from scratch on every startup.
 
@@ -31,6 +43,16 @@ def build_collection(
     supplied by the caller (parsed from the current contents of docs/).  This
     ensures that dropping a new PDF into docs/ and restarting the app is
     sufficient to ingest it — no code change, no manual cache deletion.
+
+    When ``use_contextual_headers`` is True and a ProductInfo entry exists for a
+    chunk's source, the embedding input is ``"Brand (Ingredient) — Section\\nbody"``
+    while the stored/returned document text remains the raw body.  This separates
+    the two concerns: the index vector encodes product identity; the retrieved text
+    stays verbatim for downstream body-only gating.
+
+    When ``use_contextual_headers`` is False or no ProductInfo is available for a
+    chunk, ``chunk.body`` is embedded directly (same behaviour as before this flag
+    was introduced).
 
     IMPORTANT: metadata={"hnsw:space": "cosine"} is required.
     Without it, Chroma defaults to L2/Euclidean distance, and the returned
@@ -49,8 +71,21 @@ def build_collection(
         metadata={"hnsw:space": "cosine"},
     )
     if chunks:
+        embed_texts: list[str] = []
+        for c in chunks:
+            if use_contextual_headers and product_infos and c.source in product_infos:
+                header = _contextual_header(c, product_infos[c.source])
+                embed_texts.append(f"{header}\n{c.body}")
+            else:
+                embed_texts.append(c.body)
+        # Embeddings are computed manually so the stored document text (pure body)
+        # can differ from what was embedded (header+body).  Chroma's auto-embed path
+        # always stores and indexes the same string, which would expose the header in
+        # retrieved results and break the body-only gating contract.
+        embeddings = ef(embed_texts)
         collection.add(
             documents=[c.body for c in chunks],
+            embeddings=embeddings,
             metadatas=[{"source": c.source, "section": c.section} for c in chunks],
             ids=[f"{c.source}::{c.section}" for c in chunks],
         )
