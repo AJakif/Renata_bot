@@ -2,7 +2,9 @@
 
 **Triage label:** `ready-for-agent`
 **Status:** ready to build
-**Note:** no issue tracker is configured in this environment — publish manually.
+**Issues:** broken down into 14 vertical slices at
+`github.com/AJakif/Renata_bot/issues` — #1–#12 `ready-for-agent`, #13–#14
+`ready-for-human`.
 
 ---
 
@@ -21,10 +23,16 @@ difference between a grounded answer and a fluent invention.
 
 Compounding this, the leaflets are structurally near-identical. Storage
 instructions across products are effectively boilerplate (measured 0.82 mean
-cosine similarity between different products' storage sections), and 19 of 24
-sections never name their own product in the body text. A naive retrieval system
-will confidently answer a question about one medicine using another medicine's
-leaflet.
+cosine similarity between different products' storage sections — pending re-run
+over the fifth document), and **22 of 30** sections never name their own product
+in the body text. A naive retrieval system will confidently answer a question
+about one medicine using another medicine's leaflet.
+
+A sharper version of the same risk: some topics appear in exactly one leaflet.
+Driving is covered only by Fenadin; children only by Doxicap, Rolip and Fenadin.
+Asked about a product whose leaflet omits the topic, retrieval returns a
+genuinely relevant passage from a *different* product — so the failure looks like
+a well-cited answer rather than an obvious error.
 
 Staff therefore need three things at once: the right answer, proof of where it
 came from, and an explicit refusal when the documents don't cover the question.
@@ -124,29 +132,49 @@ Citations are precise enough to verify: not "see the Maxpro leaflet" but
     the honesty/helpfulness balance can be tuned without a code change.
 36. As a maintainer, I want retrieval measurable independently of generation, so
     that I can tell which layer caused a bad answer.
+37. As a staff member, I want a question naming one product never answered from
+    another product's leaflet, even when that other leaflet genuinely covers the
+    topic, so that a well-cited answer is never a wrong-product answer.
+38. As a staff member, I want a question that names no product to be answered for
+    each relevant product by name, so that I am not silently given one product's
+    answer to a question I asked generally.
+39. As an evaluator, I want to run the whole service on a machine with no Python
+    toolchain, so that my environment is not a prerequisite for assessing it.
+40. As an evaluator, I want the service to work with no network access after
+    setup, so that ingestion and retrieval are verifiable offline.
+41. As a maintainer, I want every configuration of the retrieval design
+    measurable from a single command, so that a design claim can be re-verified
+    rather than trusted.
 
 ## Implementation Decisions
 
 **Modules**
 
-- **Ingestion** — reads leaflet PDFs, produces chunks with metadata. Layout-
-  preserving text extraction to keep dose tables readable. Page-break form-feed
-  characters are stripped *before* heading detection; without this, headings that
-  fall immediately after a page break are silently missed (observed in 2 of 4
+- **Ingestion** — reads leaflet PDFs, produces chunks with metadata. Extraction
+  is **pure Python** (`pypdf`, layout mode), never a system binary: the usual
+  choice, `pdftotext`, is a poppler executable that is absent from stock Windows
+  and macOS and cannot be pip-installed, which alone would break the five-minute
+  setup requirement. Layout mode is required to keep dose tables readable, and
+  has been verified against the worst case. Page-break form-feed characters are
+  stripped *before* heading detection; without this, headings that fall
+  immediately after a page break are silently missed (observed in 2 of 5
   documents). The identical trailing legal disclaimer is stripped — at roughly 20
-  words against a 39-word median chunk it is over a third noise.
+  words against a 40-word median chunk it is over a third noise. Unicode dashes
+  and quotes are normalized, and **all file I/O is explicitly UTF-8** (the
+  platform default on Windows is cp1252 and corrupts the text).
 - **Chunking** — one chunk per leaflet section, no splitting and no overlap.
-  Sections measured at 21–96 words, so there is nothing to split, and the
+  Sections measured at 17–97 words, so there is nothing to split, and the
   citation contract requires an exact section name rather than an inferred one. A
   synthetic **Product overview** chunk captures the header block (brand, active
   ingredient, form, manufacturer, pack and price) that sits above the first
-  numbered section and would otherwise be unretrievable.
+  numbered section and would otherwise be unretrievable. 35 chunks total.
 - **Index** — local vector store plus a keyword index over the same text. Vector
   space set explicitly to cosine; the default is Euclidean and returns distance
   rather than similarity, which silently inverts threshold logic.
 - **Retrieval** — hybrid. Reciprocal rank fusion over dense and keyword results,
-  returning five chunks.
-- **Grounding** — three independent layers (below).
+  returning eight chunks — one slot per product plus headroom for fusion noise,
+  since an unscoped question must be answerable for all five products at once.
+- **Grounding** — four independent layers (below).
 - **LLM provider adapter** — a single `generate(prompt) -> str` behind an
   environment variable. Deliberately not a routing layer, fallback chain, or
   cost-aware selector.
@@ -188,20 +216,38 @@ the number shown to the user is the number the system trusted. Citations are
 sorted by that score descending, since ranking by fusion while reporting cosine
 would otherwise emit non-monotonic scores that read as a defect.
 
-**Grounding — three layers**
+**Grounding — four layers**
 
-1. **Similarity gate.** Best body-only cosine below threshold → refuse without
+1. **Product scope.** If the question names a known brand or active ingredient,
+   retrieved chunks belonging to any other product are discarded before scoring.
+   Literal, case-insensitive, word-boundary matching against the list ingestion
+   already produces. A question naming no product is left unfiltered.
+2. **Similarity gate.** Best body-only cosine below threshold → refuse without
    calling the model.
-2. **Prompt constraint.** Numbered context, answer only from context, must return
+3. **Prompt constraint.** Numbered context, answer only from context, must return
    the ids of chunks used. Temperature zero.
-3. **Cite-or-refuse.** Returned ids are validated against the retrieved set,
+4. **Cite-or-refuse.** Returned ids are validated against the retrieved set,
    unrecognised ids are discarded, and if none survive the answer is dropped in
    favour of a refusal.
 
-Layer 1 alone is insufficient: a question about alcohol interaction retrieves the
+Layer 2 alone is insufficient: a question about alcohol interaction retrieves the
 contraindications section at reasonable similarity, but that section says nothing
-about alcohol. Layer 3 requires id validation, or a hallucinated citation passes
+about alcohol. Layer 4 requires id validation, or a hallucinated citation passes
 the check it was meant to fail.
+
+**Layer 1 exists because layers 2–4 defend the topic axis and not the product
+axis.** Asked "can I drive after taking Rolac?", retrieval surfaces Fenadin's
+driving passage at high similarity, the threshold passes, the model answers from
+it, and the id it cites genuinely was in the retrieved set — so cite-or-refuse
+passes too. The output is an honest citation above a wrong answer. Validating
+that a chunk was *retrieved* is not the same as validating that it concerns the
+product asked about. This layer must sit outside the retrieval function, so that
+retrieval quality can still be measured independently of it.
+
+**Unscoped questions.** When no product is named, every disambiguation mechanism
+is inert at once. Rather than answer from whichever product happens to rank
+first, the response answers per product and attributes each by name, citing all
+of them. This is attribution, not synthesis — no comparison across documents.
 
 **API contract**
 
@@ -212,12 +258,33 @@ response shape, so the client needs no branching.
 
 **Model choices**
 
-Local sentence-embedding model on CPU, no key required. Hosted free-tier
-generation by default, local model via environment variable as the offline path.
-The hosted default exists because the setup promise is five minutes and pulling a
-local model is a multi-gigabyte download. Embeddings and retrieval are fully
-local either way, so ingestion and retrieval can be verified with no API key at
-all.
+Local sentence-embedding model on CPU, no key required — `all-MiniLM-L6-v2` in
+its ONNX form, which the vector store already depends on. This avoids pulling
+`torch` and `transformers` (~41 additional packages, ~2.5 GB installed, and on
+Linux a default `pip install torch` fetches the CUDA build — GPU libraries into
+a service the brief specifies must run without a GPU). The ONNX path is the same
+model at roughly a sixth of the footprint, and its output vectors arrive
+L2-normalized, so cosine similarity is a plain dot product.
+
+The whole stack must fit a modest laptop: ~370 MB installed, well under 400 MB
+resident with the hosted provider, comfortable at 4 GB RAM.
+
+Generation provider **and** model id are read from `.env` at startup, never
+hardcoded — a shipped `.env.example` documents both paths. Default is hosted
+free-tier; the local model is selected by changing one variable. Neither is a
+special case: the adapter is a single `generate(prompt) -> str` with two
+implementations, chosen by configuration, with **no runtime auto-detection** —
+a provider that varies by machine would contradict the determinism requirement.
+
+The hosted default is a deliberate, documented deviation from the brief, which
+recommends the local model. The two requirements conflict: install-and-run in
+under five minutes cannot absorb a multi-gigabyte model pull and a running
+daemon on a modest laptop, even at the ~2 GB sizes the brief names as
+acceptable. The hard setup requirement wins; the preference is satisfied by one
+environment variable.
+
+Embeddings and retrieval are fully local either way, so ingestion and retrieval
+can be verified with no API key at all.
 
 ## Testing Decisions
 
@@ -245,13 +312,25 @@ through Seam 2: if the form-feed heading defect regresses, the affected sections
 disappear from retrieval results and Seam 2 fails loudly. One startup assertion
 on chunk count and section coverage per document covers the remainder.
 
-**Evaluation set.** Eight questions, adversarial by construction. In-scope rows
-target the measured collision hotspots (storage at 0.82, administration at 0.56)
-rather than easy cases. Hard negatives use topics verified absent from every
-leaflet — alcohol, missed dose, overdose, driving. One question is answerable for
-two products and absent for a third, testing grounding and disambiguation
-together. Reported: correct document retrieved, correct section cited, correct
-refusals, false refusals.
+**Evaluation set.** Eleven questions, adversarial by construction. In-scope rows
+target the measured collision hotspots (storage, administration) rather than easy
+cases. Hard negatives use topics verified absent from all five leaflets —
+alcohol, missed dose, overdose. Two asymmetry pairs cover topics that exist in
+the corpus but not in the leaflet being asked about: children (answerable for
+three products, absent for two) and driving (answerable for one, absent for
+four). Reported: correct document retrieved, correct section cited, false
+refusals, and refusals split into two counts — topic absent everywhere versus
+topic present in another product. The split is deliberate: the first is what the
+similarity threshold can catch, the second is what it cannot catch by
+construction.
+
+**Evaluation is a script, not a manual procedure.** The configuration matrix is
+contextual headers on/off × hybrid on/off × single/dual vector × product filter
+on/off. Run by hand that is up to eight passes over eleven questions, which will
+not fit the time budget. Written once as a loop over a configuration dictionary
+emitting a single table, the additional configurations cost nothing, and every
+measured claim in the design document comes from one command. It also makes
+threshold tuning demonstrable live rather than described.
 
 **No prior art** — greenfield.
 
@@ -266,18 +345,41 @@ refusals, false refusals.
 - Graph or agent orchestration. The pipeline is linear. The point at which it
   would earn its place is retrieval retry with a rewritten query after a failed
   threshold gate — the first thing to add with more time.
-- Containerisation. A cold build installing the embedding stack exceeds the
-  five-minute setup promise, so it would undercut a core requirement to satisfy
-  an optional one.
 - Authentication, user accounts, deployment infrastructure, hosted vector
   database, response streaming.
 - Any UI work beyond a single unstyled page.
 
+**Containerisation** — now in scope. A `Dockerfile` and Compose file ship
+alongside the pip path, so the service runs on a machine with no Python
+toolchain. Both the embedding model and the built index are baked at image build
+time, so a container starts immediately and needs no network at runtime; without
+this the model is fetched on first use, which would break the offline claim.
+Compose maps the host gateway explicitly, because a container cannot reach a
+local model daemon on `localhost` — on Linux this is the difference between the
+offline path working and a connection error. Adding a leaflet still needs no
+rebuild: the documents folder is mounted and ingestion is re-run.
+
+*(An earlier revision excluded containerisation on the grounds that installing
+the embedding stack exceeded the setup promise. That reasoning was wrong — the
+pip path installed the same stack, so containerisation relocated the cost rather
+than adding it. With the ONNX embedding path the question is moot: the image is
+under a gigabyte.)*
+
 ## Further Notes
 
-**Confirm document count.** The brief specifies five leaflets; four were
-available at design time. All measurements above are over four and should be
-re-run once the fifth is present.
+**Document count resolved.** All five leaflets are present. Counts and section
+statistics have been re-measured over all five; the cross-document similarity
+table is the one remaining figure still quoted from the four-document
+measurement and must be re-run before it is published.
+
+**Two decisions carry explicit kill criteria** — the dual embedding and hybrid
+retrieval. Both are measured against their simpler baseline, and either is
+deleted, with the removal documented, if the baseline performs as well.
+Building, measuring, and removing is a stronger signal than either building or
+skipping.
+
+**Setup claims are measured, not asserted.** Install-and-run time, image size and
+cold-start time are recorded for both the pip and container paths.
 
 **Restraint must be documented.** Every out-of-scope item belongs in the design
 document with its reasoning. Undocumented restraint reads as ignorance;
