@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leaflet Assistant</title>
+</head>
+<body>
+  <h1>Leaflet Assistant</h1>
+  <p><em>Internal reference grounded in provided medicine leaflets. Not medical advice.</em></p>
+
+  <form id="ask-form">
+    <label for="question">Your question:</label><br>
+    <textarea id="question" name="question" rows="3" cols="60" placeholder="e.g. What is Doxicap used for?"></textarea><br>
+    <button type="submit">Ask</button>
+  </form>
+
+  <div id="result" style="margin-top: 1.5em;"></div>
+
+  <script>
+    document.getElementById('ask-form').addEventListener('submit', async function (e) {
+      e.preventDefault();
+      const question = document.getElementById('question').value.trim();
+      if (!question) return;
+
+      const resultDiv = document.getElementById('result');
+      resultDiv.textContent = 'Loading…';
+
+      try {
+        const resp = await fetch('/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+        });
+        if (!resp.ok) {
+          resultDiv.textContent = 'Error: ' + resp.status + ' ' + resp.statusText;
+          return;
+        }
+        const data = await resp.json();
+
+        let html = '<h2>Answer</h2><p>' + escapeHtml(data.answer) + '</p>';
+
+        if (data.citations && data.citations.length > 0) {
+          html += '<h3>Citations</h3><ol>';
+          for (const c of data.citations) {
+            html += '<li>'
+              + escapeHtml(c.source) + ' — '
+              + escapeHtml(c.section)
+              + ' (score: ' + c.score.toFixed(4) + ')'
+              + '</li>';
+          }
+          html += '</ol>';
+        } else {
+          html += '<p><em>No citations.</em></p>';
+        }
+
+        resultDiv.innerHTML = html;
+      } catch (err) {
+        resultDiv.textContent = 'Request failed: ' + err;
+      }
+    });
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+  </script>
+</body>
+</html>

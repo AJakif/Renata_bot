@@ -1,0 +1,42 @@
+[project]
+name = "leaflet-assistant"
+version = "0.1.0"
+description = "Grounded RAG service over medicine leaflets"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.139",
+    "uvicorn[standard]>=0.50",
+    "chromadb>=1.5",
+    "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "mypy>=2.2",
+    "ruff>=0.15",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+# chromadb ships no stubs; ignore missing imports from it
+[[tool.mypy.overrides]]
+module = ["chromadb.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
