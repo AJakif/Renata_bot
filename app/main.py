@@ -24,8 +24,12 @@ CHROMA_DIR = Path(__file__).parent.parent / "chroma_db"
 STATIC_DIR = Path(__file__).parent.parent / "static"
 TOP_K: int = int(os.getenv("TOP_K", "5"))
 
-# Expected totals for the startup integrity assertion.
-_EXPECTED_CHUNK_COUNT = 35  # 5 docs × 7 chunks (1 overview + 6 sections)
+# Structural invariant checked at startup: every document must yield exactly
+# one overview chunk plus six numbered sections. The total is derived from the
+# number of PDFs actually found, not hardcoded, so dropping a new leaflet into
+# docs/ and restarting requires no code change (adding a doc changes doc count,
+# not this per-document invariant).
+_CHUNKS_PER_DOC = 7  # 1 overview + 6 numbered sections
 _EXPECTED_SECTIONS_PER_DOC = 6
 
 # Initialized during lifespan startup; overridable in tests via
@@ -61,10 +65,12 @@ def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
     or incomplete data.  parse_pdf already validates each document individually;
     this aggregates across all documents.
     """
-    if len(chunks) != _EXPECTED_CHUNK_COUNT:
+    expected_total = len(pdf_paths) * _CHUNKS_PER_DOC
+    if len(chunks) != expected_total:
         raise RuntimeError(
-            f"Startup assertion failed: expected {_EXPECTED_CHUNK_COUNT} total chunks, "
-            f"got {len(chunks)}.  Check that all PDFs ingested correctly."
+            f"Startup assertion failed: expected {expected_total} total chunks "
+            f"({len(pdf_paths)} docs x {_CHUNKS_PER_DOC}), got {len(chunks)}.  "
+            "Check that all PDFs ingested correctly."
         )
     for pdf_path in pdf_paths:
         fname = pdf_path.name

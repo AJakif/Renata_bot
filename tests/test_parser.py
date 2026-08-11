@@ -117,6 +117,24 @@ def test_extract_product_info_all_pdfs() -> None:
         assert product_stem.lower() in info.brand.lower(), (
             f"{pdf.name}: brand {info.brand!r} does not contain {product_stem!r}"
         )
+        # No overview field value should be truncated mid-parenthesis or
+        # mid-word by a continuation line (regression: Rolip's two-line
+        # "Rosuvastatin (as Rosuvastatin\n  Calcium) 10 mg" used to be cut at
+        # "Calcium" because a capitalized continuation word was mistaken for
+        # the start of the next field).
+        assert info.active_ingredient.count("(") == info.active_ingredient.count(")"), (
+            f"{pdf.name}: unbalanced parens in active_ingredient {info.active_ingredient!r}"
+        )
+
+
+def test_rolip_active_ingredient_not_truncated() -> None:
+    """Rolip's ingredient wraps onto an indented continuation line in the PDF;
+    it must be joined in full, not cut off at the wrap point."""
+    pdf = DOCS_DIR / "rolip_10mg_rosuvastatin_leaflet.pdf"
+    info = extract_product_info(parse_pdf(pdf))
+    assert info.active_ingredient == "Rosuvastatin (as Rosuvastatin Calcium) 10 mg", (
+        f"Rolip active_ingredient truncated or malformed: {info.active_ingredient!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

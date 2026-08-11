@@ -29,8 +29,11 @@ _HEADING_RE = re.compile(r"^(\d+)\.\s+(.+)$", re.MULTILINE)
 
 # pypdf layout extraction sometimes runs a heading directly onto the preceding
 # text without a newline (observed in doxicap §4, rolac §5).  Insert \n before
-# any digit+dot+space that is not already at the start of a line.
-_HEADING_NEWLINE_RE = re.compile(r"(?<!\n)(?=\d+\. )")
+# a digit 1-6 + dot + space + capital letter that is not already at the start
+# of a line — narrowed to the actual heading shape ("4. Possible...") so this
+# can't fire on incidental in-body text like "vitamin B12. Take..." or a
+# decimal dose ("3.5 mg", which has no space after the dot).
+_HEADING_NEWLINE_RE = re.compile(r"(?<!\n)(?=[1-6]\. [A-Z])")
 
 
 @dataclass
@@ -72,13 +75,22 @@ def _normalize_unicode(text: str) -> str:
     return text.translate(_UNICODE_NORM_TABLE)
 
 
+# The fixed set of §0 overview field labels across all five leaflets. Used as
+# anchors so a field's value — which may wrap onto an indented continuation
+# line, e.g. Rolip's "Rosuvastatin (as Rosuvastatin\n  Calcium) 10 mg" — is
+# only terminated by the next real label, never by a capitalized word inside
+# the value itself (that previously truncated Rolip's ingredient at "Calcium").
+_OVERVIEW_LABELS = ("Brand name", "Active ingredient", "Form", "Manufacturer", "Pack & price")
+
+
 def _field_from_overview(body: str, label: str) -> str | None:
     """Extract a named field value from the §0 overview block.
 
     Handles values that continue onto the next indented line (e.g. Rolip's
     active ingredient spans two lines in the PDF).
     """
-    pattern = rf"{re.escape(label)}\s+(.+?)(?=\n\s*[A-Z][a-z]|\Z)"
+    other_labels = "|".join(re.escape(other) for other in _OVERVIEW_LABELS if other != label)
+    pattern = rf"{re.escape(label)}\s+(.+?)(?=\n\s*(?:{other_labels})\b|\Z)"
     m = re.search(pattern, body, re.DOTALL)
     if m is None:
         return None
