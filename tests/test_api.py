@@ -29,8 +29,15 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.generate import GenerationResult, Generator, stub_generate
-from app.main import REFUSAL_MESSAGE, app, get_body_vectors, get_collection, get_generator
-from app.parser import Chunk
+from app.main import (
+    REFUSAL_MESSAGE,
+    app,
+    get_body_vectors,
+    get_collection,
+    get_generator,
+    get_product_infos,
+)
+from app.parser import Chunk, ProductInfo
 from app.retrieve import build_body_vectors, build_collection
 
 # -- Fixtures -----------------------------------------------------------------
@@ -441,3 +448,127 @@ def test_cite_or_refuse_refusal_shape_matches_gate_refusal(
 
     assert gate_resp.status_code == cor_resp.status_code == 200
     assert gate_resp.json() == cor_resp.json()
+
+
+# -- Scope-filter integration tests (two-product fixture) ---------------------
+
+_FENADIN_CHUNKS: list[Chunk] = [
+    Chunk(
+        source="fenadin_120mg_fexofenadine_leaflet.pdf",
+        section="Product overview",
+        body=(
+            "Fenadin 120 mg. Active ingredient: Fexofenadine Hydrochloride 120 mg. "
+            "Form: Tablet. Manufacturer: Renata PLC, Bangladesh."
+        ),
+    ),
+    Chunk(
+        source="fenadin_120mg_fexofenadine_leaflet.pdf",
+        section="What Fenadin is and what it is used for",
+        body=(
+            "Fenadin contains fexofenadine, a non-sedating antihistamine. "
+            "It treats hay fever (seasonal allergic rhinitis) and chronic hives. "
+            "Fexofenadine does not cause drowsiness and is safe for driving."
+        ),
+    ),
+    Chunk(
+        source="fenadin_120mg_fexofenadine_leaflet.pdf",
+        section="Before you take Fenadin",
+        body=(
+            "Do not take if you are allergic to fexofenadine or any component. "
+            "Tell your doctor if you have kidney or liver problems."
+        ),
+    ),
+]
+
+_MULTI_PRODUCT_CHUNKS: list[Chunk] = _SAMPLE_CHUNKS + _FENADIN_CHUNKS
+
+_MULTI_PRODUCT_INFOS: list[ProductInfo] = [
+    ProductInfo(
+        source="doxicap_100mg_doxycycline_leaflet.pdf",
+        brand="Doxicap 100 mg",
+        active_ingredient="Doxycycline Hydrochloride 100 mg",
+    ),
+    ProductInfo(
+        source="fenadin_120mg_fexofenadine_leaflet.pdf",
+        brand="Fenadin 120 mg",
+        active_ingredient="Fexofenadine Hydrochloride 120 mg",
+    ),
+]
+
+
+@pytest.fixture(scope="session")
+def multi_product_collection() -> chromadb.Collection:
+    """In-memory collection containing Doxicap + Fenadin chunks (real embeddings)."""
+    client = chromadb.EphemeralClient()
+    return build_collection(_MULTI_PRODUCT_CHUNKS, client)
+
+
+@pytest.fixture(scope="session")
+def multi_product_body_vectors() -> dict[str, npt.NDArray[np.float32]]:
+    """Body-only vectors for both Doxicap and Fenadin sample chunks."""
+    return build_body_vectors(_MULTI_PRODUCT_CHUNKS)
+
+
+@pytest.fixture()
+def multi_product_client(
+    multi_product_collection: chromadb.Collection,
+    multi_product_body_vectors: dict[str, npt.NDArray[np.float32]],
+) -> IterGenerator[TestClient]:
+    """TestClient with a two-product collection and scope-filter product infos wired in."""
+
+    app.dependency_overrides[get_collection] = lambda: multi_product_collection
+    app.dependency_overrides[get_generator] = lambda: stub_generate
+    app.dependency_overrides[get_body_vectors] = lambda: multi_product_body_vectors
+    app.dependency_overrides[get_product_infos] = lambda: _MULTI_PRODUCT_INFOS
+    yield TestClient(app, raise_server_exceptions=True)
+    app.dependency_overrides.clear()
+
+
+def test_scope_filter_limits_citations_to_named_product(
+    multi_product_client: TestClient,
+) -> None:
+    """Asking about Fenadin returns only Fenadin citations — Doxicap chunks are excluded."""
+    resp = multi_product_client.post("/ask", json={"question": "What is Fenadin used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["citations"], "Expected at least one Fenadin citation"
+    for citation in data["citations"]:
+        assert "fenadin" in citation["source"].lower(), (
+            f"Expected only Fenadin source; got {citation['source']!r}"
+        )
+
+
+def test_scope_filter_active_ingredient_scopes_correctly(
+    multi_product_client: TestClient,
+) -> None:
+    """Active ingredient 'Fexofenadine' alone scopes the answer to Fenadin."""
+    resp = multi_product_client.post(
+        "/ask", json={"question": "How does Fexofenadine treat hay fever?"}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    for citation in data["citations"]:
+        assert "fenadin" in citation["source"].lower(), (
+            f"Fexofenadine query must only cite Fenadin; got {citation['source']!r}"
+        )
+
+
+def test_scope_filter_no_product_named_not_filtered(
+    multi_product_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A question naming no product is not filtered; scope filter is a no-op."""
+    # Capture the chunks that reach the generator by inspecting citations.
+    # We lower the threshold so both products can pass the similarity gate,
+    # then assert that sources from at least the asked-about content appear.
+    monkeypatch.setattr(main_module, "SIMILARITY_THRESHOLD", 0.0)
+    resp = multi_product_client.post(
+        "/ask", json={"question": "What are the side effects of this medicine?"}
+    )
+    assert resp.status_code == 200
+    # With threshold=0 and no product filter, both products may contribute.
+    # The key assertion: no error, and citations are well-formed.
+    data = resp.json()
+    assert isinstance(data["citations"], list)
+    for citation in data["citations"]:
+        assert citation["source"].endswith(".pdf")

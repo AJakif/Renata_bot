@@ -19,6 +19,7 @@ from app.generate import Generator, parse_generation_result, stub_generate
 from app.parser import Chunk, ProductInfo, extract_product_info, parse_pdf
 from app.retrieve import build_bm25_index, build_body_vectors, build_collection
 from app.retrieve import retrieve as _retrieve
+from app.scope import filter_by_product_scope
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,11 @@ _product_infos: list[ProductInfo] = []
 def get_body_vectors() -> dict[str, npt.NDArray[np.float32]]:
     """FastAPI dependency that returns the active body-only vector store."""
     return _body_vectors
+
+
+def get_product_infos() -> list[ProductInfo]:
+    """FastAPI dependency that returns the per-product brand/ingredient registry."""
+    return _product_infos
 
 
 def get_collection() -> chromadb.Collection:
@@ -198,6 +204,7 @@ async def ask(
     collection: Annotated[chromadb.Collection, Depends(get_collection)],
     generator: Annotated[Generator, Depends(get_generator)],
     body_vectors: Annotated[dict[str, npt.NDArray[np.float32]], Depends(get_body_vectors)],
+    product_infos: Annotated[list[ProductInfo], Depends(get_product_infos)],
 ) -> AskResponse:
     """Retrieve relevant chunks, apply the similarity gate, and generate a grounded answer.
 
@@ -220,6 +227,7 @@ async def ask(
         body_vectors=body_vectors if DUAL_EMBEDDING else None,
         use_dual_embedding=DUAL_EMBEDDING,
     )
+    chunks = filter_by_product_scope(body.question, chunks, product_infos)
 
     best_score = max((r.score for r in chunks), default=0.0)
     if best_score < SIMILARITY_THRESHOLD:
