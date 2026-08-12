@@ -11,9 +11,15 @@ These tests cover:
   AC2  non-empty answer and at least one citation with correct section
   AC5  identical output for repeated identical questions (determinism)
   AC6  collection is created with cosine space explicitly configured
+  Cite-or-refuse: unknown id discarded, all-invalid → refusal, mixed,
+                  answered=False, answered=True with no valid ids (false refusal),
+                  malformed output → refusal.
 """
 
+import logging
 from collections.abc import Generator as IterGenerator
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import chromadb
 import numpy as np
@@ -22,7 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
-from app.generate import Generator, stub_generate
+from app.generate import GenerationResult, Generator, stub_generate
 from app.main import REFUSAL_MESSAGE, app, get_body_vectors, get_collection, get_generator
 from app.parser import Chunk
 from app.retrieve import build_body_vectors, build_collection
@@ -234,3 +240,204 @@ def test_scores_never_negative(client: TestClient) -> None:
     data = resp.json()
     scores = [c["score"] for c in data["citations"]]
     assert all(s >= 0.0 for s in scores), f"Negative score(s) in citations: {scores}"
+
+
+# -- Cite-or-refuse tests (layer 3 grounding) ---------------------------------
+
+
+@contextmanager
+def _client_with_generator(
+    collection: chromadb.Collection,
+    body_vectors: dict[str, npt.NDArray[np.float32]],
+    gen: Generator,
+) -> Iterator[TestClient]:
+    """Context manager: TestClient with custom collection, body vectors, and generator."""
+
+    app.dependency_overrides[get_collection] = lambda: collection
+    app.dependency_overrides[get_generator] = lambda: gen
+    app.dependency_overrides[get_body_vectors] = lambda: body_vectors
+    try:
+        yield TestClient(app, raise_server_exceptions=True)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_unknown_id_discarded(
+    ephemeral_collection: chromadb.Collection,
+    sample_body_vectors: dict[str, npt.NDArray[np.float32]],
+) -> None:
+    """Stub cites a valid id alongside an out-of-range id — only the valid id survives."""
+
+    def _stub(prompt: str, *, timeout: float = 30.0, temperature: float = 0.0) -> str:
+        return GenerationResult(
+            answered=True,
+            answer="test answer",
+            chunk_ids=[1, 999],
+        ).model_dump_json()
+
+    with _client_with_generator(ephemeral_collection, sample_body_vectors, _stub) as tc:
+        resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["answer"] == "test answer"
+    assert len(data["citations"]) == 1
+
+
+def test_all_invalid_ids_causes_refusal(
+    ephemeral_collection: chromadb.Collection,
+    sample_body_vectors: dict[str, npt.NDArray[np.float32]],
+) -> None:
+    """Stub cites only out-of-range ids → refusal; stub answer text absent from response."""
+    stub_answer = "CANARY_ANSWER_TEXT_MUST_NOT_APPEAR"
+
+    def _stub(prompt: str, *, timeout: float = 30.0, temperature: float = 0.0) -> str:
+        return GenerationResult(
+            answered=True,
+            answer=stub_answer,
+            chunk_ids=[997, 998, 999],
+        ).model_dump_json()
+
+    with _client_with_generator(ephemeral_collection, sample_body_vectors, _stub) as tc:
+        resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["answer"] == REFUSAL_MESSAGE
+    assert data["citations"] == []
+    assert stub_answer not in resp.text, "Stub answer text must not appear anywhere in response"
+
+
+def test_mixed_valid_invalid_ids_only_valid_returned(
+    ephemeral_collection: chromadb.Collection,
+    sample_body_vectors: dict[str, npt.NDArray[np.float32]],
+) -> None:
+    """Stub cites [1, 999, 2] → only ids 1 and 2 survive; exactly 2 citations."""
+
+    def _stub(prompt: str, *, timeout: float = 30.0, temperature: float = 0.0) -> str:
+        return GenerationResult(
+            answered=True,
+            answer="mixed answer",
+            chunk_ids=[1, 999, 2],
+        ).model_dump_json()
+
+    with _client_with_generator(ephemeral_collection, sample_body_vectors, _stub) as tc:
+        resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["answer"] == "mixed answer"
+    assert len(data["citations"]) == 2
+
+
+def test_answered_false_causes_refusal_regardless_of_chunk_ids(
+    ephemeral_collection: chromadb.Collection,
+    sample_body_vectors: dict[str, npt.NDArray[np.float32]],
+) -> None:
+    """answered=False with non-empty chunk_ids and non-empty answer → fixed refusal.
+
+    D24 regression case: a model signalling refusal semantics while attaching
+    ids and answer text must not leak either into the response.
+    """
+    stub_answer = "SHOULD_NOT_APPEAR_IN_RESPONSE"
+
+    def _stub(prompt: str, *, timeout: float = 30.0, temperature: float = 0.0) -> str:
+        return GenerationResult(
+            answered=False,
+            answer=stub_answer,
+            chunk_ids=[1, 2],
+        ).model_dump_json()
+
+    with _client_with_generator(ephemeral_collection, sample_body_vectors, _stub) as tc:
+        resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["answer"] == REFUSAL_MESSAGE
+    assert data["citations"] == []
+    assert stub_answer not in resp.text
+
+
+def test_answered_true_no_valid_ids_is_false_refusal(
+    ephemeral_collection: chromadb.Collection,
+    sample_body_vectors: dict[str, npt.NDArray[np.float32]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """answered=True with chunk_ids=[] → refusal + warning log (the false-refusal case).
+
+    The response shape is identical to other refusals; the warning log is the
+    observable signal that distinguishes this branch from a normal refusal so
+    that false-refusal rate can be tracked rather than suppressed.
+    """
+
+    def _stub(prompt: str, *, timeout: float = 30.0, temperature: float = 0.0) -> str:
+        return GenerationResult(
+            answered=True,
+            answer="answer that should not appear",
+            chunk_ids=[],
+        ).model_dump_json()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="app.main"),
+        _client_with_generator(ephemeral_collection, sample_body_vectors, _stub) as tc,
+    ):
+        resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["answer"] == REFUSAL_MESSAGE
+    assert data["citations"] == []
+    assert "cite-or-refuse" in caplog.text
+    assert "no valid chunk_ids survived validation" in caplog.text
+
+
+def test_malformed_generator_output_causes_refusal(
+    ephemeral_collection: chromadb.Collection,
+    sample_body_vectors: dict[str, npt.NDArray[np.float32]],
+) -> None:
+    """Unparseable model output → refusal; no partial answer is emitted."""
+
+    def _stub(prompt: str, *, timeout: float = 30.0, temperature: float = 0.0) -> str:
+        return "not valid json {{{"
+
+    with _client_with_generator(ephemeral_collection, sample_body_vectors, _stub) as tc:
+        resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["answer"] == REFUSAL_MESSAGE
+    assert data["citations"] == []
+
+
+def test_cite_or_refuse_refusal_shape_matches_gate_refusal(
+    ephemeral_collection: chromadb.Collection,
+    sample_body_vectors: dict[str, npt.NDArray[np.float32]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cite-or-refuse refusal and similarity-gate refusal have identical response shapes."""
+
+    # Gate refusal: raise threshold so every query is refused before generation.
+    def _get_col() -> chromadb.Collection:
+        return ephemeral_collection
+
+    def _get_gen() -> Generator:
+        return stub_generate
+
+    def _get_bv() -> dict[str, npt.NDArray[np.float32]]:
+        return sample_body_vectors
+
+    app.dependency_overrides[get_collection] = _get_col
+    app.dependency_overrides[get_generator] = _get_gen
+    app.dependency_overrides[get_body_vectors] = _get_bv
+    monkeypatch.setattr(main_module, "SIMILARITY_THRESHOLD", 999.0)
+    try:
+        gate_resp = TestClient(app, raise_server_exceptions=True).post(
+            "/ask", json={"question": "What is Doxicap used for?"}
+        )
+    finally:
+        app.dependency_overrides.clear()
+        monkeypatch.undo()
+
+    # Cite-or-refuse refusal: stub returns answered=True but only invalid ids.
+    def _invalid_stub(prompt: str, *, timeout: float = 30.0, temperature: float = 0.0) -> str:
+        return GenerationResult(answered=True, answer="ignored", chunk_ids=[999]).model_dump_json()
+
+    with _client_with_generator(ephemeral_collection, sample_body_vectors, _invalid_stub) as tc:
+        cor_resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+
+    assert gate_resp.status_code == cor_resp.status_code == 200
+    assert gate_resp.json() == cor_resp.json()
