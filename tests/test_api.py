@@ -162,3 +162,20 @@ def test_citations_sorted_score_descending(client: TestClient) -> None:
     data = resp.json()
     scores = [c["score"] for c in data["citations"]]
     assert scores == sorted(scores, reverse=True), f"Citations not sorted descending: {scores}"
+
+
+def test_citation_score_is_cosine_not_rrf(client: TestClient) -> None:
+    """Citation.score is a cosine similarity ∈ [0, 1], never an RRF-derived value.
+
+    RRF scores are ~1/(60+rank) ≈ 0.016 at best — if any citation score is that
+    small for a relevant query it almost certainly leaked from the fusion layer (D7).
+    All scores must be in [0, 1] and at least one must exceed 0.5 for an
+    on-topic question against this corpus.
+    """
+    resp = client.post("/ask", json={"question": "What is Doxicap used for?"})
+    data = resp.json()
+    scores = [c["score"] for c in data["citations"]]
+    assert all(0.0 <= s <= 1.0 for s in scores), f"Score(s) outside cosine range: {scores}"
+    assert any(s > 0.5 for s in scores), (
+        f"No score > 0.5 — scores look like RRF values, not cosine similarities: {scores}"
+    )
