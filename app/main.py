@@ -11,10 +11,11 @@ import chromadb
 from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from rank_bm25 import BM25Okapi
 
 from app.generate import Generator, stub_generate
 from app.parser import Chunk, ProductInfo, extract_product_info, parse_pdf
-from app.retrieve import build_collection
+from app.retrieve import build_bm25_index, build_collection
 from app.retrieve import retrieve as _retrieve
 
 logger = logging.getLogger(__name__)
@@ -22,8 +23,13 @@ logger = logging.getLogger(__name__)
 DOCS_DIR = Path(__file__).parent.parent / "docs"
 CHROMA_DIR = Path(__file__).parent.parent / "chroma_db"
 STATIC_DIR = Path(__file__).parent.parent / "static"
-TOP_K: int = int(os.getenv("TOP_K", "5"))
+TOP_K: int = int(os.getenv("TOP_K", "8"))
 CONTEXTUAL_HEADERS: bool = os.getenv("CONTEXTUAL_HEADERS", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+HYBRID_RETRIEVAL: bool = os.getenv("HYBRID_RETRIEVAL", "true").lower() not in (
     "0",
     "false",
     "no",
@@ -40,6 +46,12 @@ _EXPECTED_SECTIONS_PER_DOC = 6
 # Initialized during lifespan startup; overridable in tests via
 # app.dependency_overrides[get_collection].
 _collection: chromadb.Collection | None = None
+
+# BM25 index and parallel chunk-id list built at startup alongside the Chroma
+# collection.  Both are None/empty when HYBRID_RETRIEVAL=false or in tests that
+# bypass lifespan — retrieve() degrades to dense-only when bm25 is None.
+_bm25_index: BM25Okapi | None = None
+_bm25_chunk_ids: list[str] = []
 
 # Per-product brand/ingredient registry built at startup alongside the chunks.
 # Consumed by future issues (e.g. product-info endpoint); not served directly.
@@ -95,7 +107,7 @@ def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     """Parse all PDFs in DOCS_DIR, embed them, and initialise the collection."""
-    global _collection, _product_infos
+    global _collection, _product_infos, _bm25_index, _bm25_chunk_ids
     chunks: list[Chunk] = []
     pdf_paths = sorted(DOCS_DIR.glob("*.pdf"))
     for pdf in pdf_paths:
@@ -111,8 +123,16 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
         product_infos_by_source,
         use_contextual_headers=CONTEXTUAL_HEADERS,
     )
+    if HYBRID_RETRIEVAL:
+        _bm25_index, _bm25_chunk_ids = build_bm25_index(
+            chunks,
+            product_infos_by_source,
+            use_contextual_headers=CONTEXTUAL_HEADERS,
+        )
     yield
     _collection = None
+    _bm25_index = None
+    _bm25_chunk_ids = []
     _product_infos.clear()
 
 
@@ -160,7 +180,14 @@ async def ask(
     3. Call the injected generator.
     4. Return answer + citations sorted by score descending.
     """
-    chunks = _retrieve(body.question, collection, top_k=TOP_K)
+    chunks = _retrieve(
+        body.question,
+        collection,
+        top_k=TOP_K,
+        bm25=_bm25_index,
+        bm25_chunk_ids=_bm25_chunk_ids,
+        use_hybrid=HYBRID_RETRIEVAL,
+    )
 
     context_blocks = "\n\n".join(
         f"[{i + 1}] ({r.source} — {r.section})\n{r.body}" for i, r in enumerate(chunks)

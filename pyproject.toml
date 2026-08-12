@@ -9,6 +9,7 @@ dependencies = [
     "chromadb>=1.5",
     "httpx>=0.28",
     "pypdf>=5.0",
+    "rank-bm25>=0.2",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,11 @@ warn_unused_configs = true
 # chromadb ships no stubs; ignore missing imports from it
 [[tool.mypy.overrides]]
 module = ["chromadb.*"]
+ignore_missing_imports = true
+
+# rank_bm25 ships no py.typed marker or stubs
+[[tool.mypy.overrides]]
+module = ["rank_bm25"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
