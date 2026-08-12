@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Annotated
 
 import chromadb
+import numpy as np
+import numpy.typing as npt
 from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -15,7 +17,7 @@ from rank_bm25 import BM25Okapi
 
 from app.generate import Generator, stub_generate
 from app.parser import Chunk, ProductInfo, extract_product_info, parse_pdf
-from app.retrieve import build_bm25_index, build_collection
+from app.retrieve import build_bm25_index, build_body_vectors, build_collection
 from app.retrieve import retrieve as _retrieve
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,17 @@ HYBRID_RETRIEVAL: bool = os.getenv("HYBRID_RETRIEVAL", "true").lower() not in (
     "false",
     "no",
 )
+DUAL_EMBEDDING: bool = os.getenv("DUAL_EMBEDDING", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# Provisional similarity gate threshold (layer 1 of grounding).  Sits in the measured
+# gap: on-topic body-only cosines 0.51–0.85, off-topic 0.01–0.18.  Formal calibration
+# against the 8-row eval set (D10) is pending — adjust via SIMILARITY_THRESHOLD env var.
+SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.35"))
+
+REFUSAL_MESSAGE: str = "I don't have enough information in the leaflets to answer that question."
 
 # Structural invariant checked at startup: every document must yield exactly
 # one overview chunk plus six numbered sections. The total is derived from the
@@ -53,9 +66,19 @@ _collection: chromadb.Collection | None = None
 _bm25_index: BM25Okapi | None = None
 _bm25_chunk_ids: list[str] = []
 
+# Body-only vector store: chunk_id → L2-normalised float32 embedding of body
+# text alone (no contextual header).  Built at startup when DUAL_EMBEDDING=true;
+# {} otherwise.  Override in tests via app.dependency_overrides[get_body_vectors].
+_body_vectors: dict[str, npt.NDArray[np.float32]] = {}
+
 # Per-product brand/ingredient registry built at startup alongside the chunks.
 # Consumed by future issues (e.g. product-info endpoint); not served directly.
 _product_infos: list[ProductInfo] = []
+
+
+def get_body_vectors() -> dict[str, npt.NDArray[np.float32]]:
+    """FastAPI dependency that returns the active body-only vector store."""
+    return _body_vectors
 
 
 def get_collection() -> chromadb.Collection:
@@ -107,7 +130,7 @@ def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     """Parse all PDFs in DOCS_DIR, embed them, and initialise the collection."""
-    global _collection, _product_infos, _bm25_index, _bm25_chunk_ids
+    global _collection, _product_infos, _bm25_index, _bm25_chunk_ids, _body_vectors
     chunks: list[Chunk] = []
     pdf_paths = sorted(DOCS_DIR.glob("*.pdf"))
     for pdf in pdf_paths:
@@ -129,10 +152,13 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
             product_infos_by_source,
             use_contextual_headers=CONTEXTUAL_HEADERS,
         )
+    if DUAL_EMBEDDING:
+        _body_vectors = build_body_vectors(chunks)
     yield
     _collection = None
     _bm25_index = None
     _bm25_chunk_ids = []
+    _body_vectors = {}
     _product_infos.clear()
 
 
@@ -171,14 +197,18 @@ async def ask(
     body: AskRequest,
     collection: Annotated[chromadb.Collection, Depends(get_collection)],
     generator: Annotated[Generator, Depends(get_generator)],
+    body_vectors: Annotated[dict[str, npt.NDArray[np.float32]], Depends(get_body_vectors)],
 ) -> AskResponse:
-    """Retrieve relevant chunks and generate a grounded answer.
+    """Retrieve relevant chunks, apply the similarity gate, and generate a grounded answer.
 
-    Pipeline (this slice — dense only, no gating):
-    1. Retrieve top-k chunks by cosine similarity.
-    2. Build a numbered context prompt.
-    3. Call the injected generator.
-    4. Return answer + citations sorted by score descending.
+    Pipeline:
+    1. Retrieve top-k chunks (hybrid or dense); when DUAL_EMBEDDING is on, each
+       ChunkResult.score is the body-only cosine (D6/D7).
+    2. Gate: if the best score is below SIMILARITY_THRESHOLD, refuse without
+       calling the LLM (layer 1 of grounding).
+    3. Build a numbered context prompt.
+    4. Call the injected generator.
+    5. Return answer + citations sorted by body-only cosine descending.
     """
     chunks = _retrieve(
         body.question,
@@ -187,7 +217,13 @@ async def ask(
         bm25=_bm25_index,
         bm25_chunk_ids=_bm25_chunk_ids,
         use_hybrid=HYBRID_RETRIEVAL,
+        body_vectors=body_vectors if DUAL_EMBEDDING else None,
+        use_dual_embedding=DUAL_EMBEDDING,
     )
+
+    best_score = max((r.score for r in chunks), default=0.0)
+    if best_score < SIMILARITY_THRESHOLD:
+        return AskResponse(answer=REFUSAL_MESSAGE, citations=[])
 
     context_blocks = "\n\n".join(
         f"[{i + 1}] ({r.source} — {r.section})\n{r.body}" for i, r in enumerate(chunks)
