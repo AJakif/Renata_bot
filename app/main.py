@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 
-from app.generate import Generator, stub_generate
+from app.generate import Generator, parse_generation_result, stub_generate
 from app.parser import Chunk, ProductInfo, extract_product_info, parse_pdf
 from app.retrieve import build_bm25_index, build_body_vectors, build_collection
 from app.retrieve import retrieve as _retrieve
@@ -229,11 +229,39 @@ async def ask(
         f"[{i + 1}] ({r.source} — {r.section})\n{r.body}" for i, r in enumerate(chunks)
     )
     prompt = (
-        "Answer the question using ONLY the numbered context passages below. "
-        "Be concise and accurate. Do not add information not present in the context.\n\n"
-        f"{context_blocks}\n\nQuestion: {body.question}\nAnswer:"
+        "You are a medicine information assistant. Answer the question using ONLY the numbered "
+        "context passages below. Use no outside knowledge.\n\n"
+        f"{context_blocks}\n\n"
+        f"Question: {body.question}\n\n"
+        "Respond with a single JSON object (no other text) matching this schema:\n"
+        '{"answered": bool, "answer": string, "chunk_ids": [int, ...]}\n'
+        "where chunk_ids lists the 1-based numbers of the passages you used. "
+        'If the context does not answer the question, set answered to false, answer to "", '
+        "and chunk_ids to []."
     )
 
-    answer = generator(prompt)
-    citations = [Citation(source=r.source, section=r.section, score=r.score) for r in chunks]
-    return AskResponse(answer=answer, citations=citations)
+    raw = generator(prompt, temperature=0.0)
+    result = parse_generation_result(raw)
+    if result is None or not result.answered:
+        return AskResponse(answer=REFUSAL_MESSAGE, citations=[])
+
+    valid_ids = {i + 1 for i in range(len(chunks))}
+    filtered_ids = [cid for cid in dict.fromkeys(result.chunk_ids) if cid in valid_ids]
+
+    if not filtered_ids:
+        logger.warning("cite-or-refuse: answered=True but no valid chunk_ids survived validation")
+        return AskResponse(answer=REFUSAL_MESSAGE, citations=[])
+
+    citations = sorted(
+        [
+            Citation(
+                source=chunks[cid - 1].source,
+                section=chunks[cid - 1].section,
+                score=chunks[cid - 1].score,
+            )
+            for cid in filtered_ids
+        ],
+        key=lambda c: c.score,
+        reverse=True,
+    )
+    return AskResponse(answer=result.answer, citations=citations)
