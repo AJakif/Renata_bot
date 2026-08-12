@@ -13,7 +13,7 @@ import pytest
 from rank_bm25 import BM25Okapi
 
 from app.parser import Chunk, ProductInfo
-from app.retrieve import build_bm25_index, build_collection, retrieve
+from app.retrieve import build_bm25_index, build_body_vectors, build_collection, retrieve
 
 _PRODUCT_A = "product_a.pdf"
 _PRODUCT_B = "product_b.pdf"
@@ -181,3 +181,111 @@ def test_hybrid_off_ignores_bm25_index(
     assert [(r.source, r.section) for r in dense_results] == [
         (r.source, r.section) for r in hybrid_off_results
     ], "use_hybrid=False with BM25 supplied must match pure dense retrieval"
+
+
+# ── Dual embedding / body-only vector tests ────────────────────────────────────
+
+# These tests need their own EphemeralClient so they are not affected by the
+# collection-clobber that occurs when the module-level hybrid_on_index fixture
+# runs build_collection() (same COLLECTION_NAME, shared Rust backend per process).
+
+
+@pytest.fixture(scope="module")
+def dual_embed_collection_and_vectors() -> tuple[chromadb.Collection, dict]:
+    """Fresh collection + body vectors for dual-embedding tests."""
+    client = chromadb.EphemeralClient()
+    collection = build_collection(_CHUNKS, client, _PRODUCT_INFOS, use_contextual_headers=True)
+    body_vectors = build_body_vectors(_CHUNKS)
+    return collection, body_vectors
+
+
+def test_body_only_score_lower_than_indexed_for_brand_query(
+    dual_embed_collection_and_vectors: tuple[chromadb.Collection, dict],
+) -> None:
+    """Dual embedding: body-only score < indexed score for a brand-name query.
+
+    A query naming the brand (e.g. "Alphazol") inflates the indexed-vector cosine
+    because the contextual header encodes the brand.  The body-only vector does not
+    contain the brand, so body-only cosine must be strictly lower.  This is the
+    core rationale for D6: headers compress the gap the gate threshold relies on.
+    """
+    collection, body_vectors = dual_embed_collection_and_vectors
+    query = "how should I store Alphazol"
+
+    # Dual embedding on: scores are body-only cosines.
+    dual_results = retrieve(
+        query,
+        collection,
+        body_vectors=body_vectors,
+        use_dual_embedding=True,
+        use_hybrid=False,
+    )
+    # Single-vector baseline: scores are indexed (header+body) cosines.
+    single_results = retrieve(
+        query,
+        collection,
+        body_vectors=body_vectors,
+        use_dual_embedding=False,
+        use_hybrid=False,
+    )
+
+    assert dual_results, "Expected results with dual embedding on"
+    assert single_results, "Expected results with dual embedding off"
+
+    dual_top = dual_results[0].score
+    single_top = single_results[0].score
+    assert dual_top < single_top, (
+        f"Body-only score ({dual_top:.4f}) should be lower than indexed score "
+        f"({single_top:.4f}) for a brand-name query — header inflation not measurable"
+    )
+
+
+def test_single_vector_mode_score_matches_indexed_vector(
+    dual_embed_collection_and_vectors: tuple[chromadb.Collection, dict],
+) -> None:
+    """use_dual_embedding=False: reported score equals the indexed-vector cosine.
+
+    Passing body_vectors but disabling dual embedding must produce the same scores
+    as passing no body_vectors at all.  The flag is the single-vector baseline
+    selector (D6 kill criterion path).
+    """
+    collection, body_vectors = dual_embed_collection_and_vectors
+    query = "bacterial infections"
+
+    single_with_bv = retrieve(
+        query,
+        collection,
+        body_vectors=body_vectors,
+        use_dual_embedding=False,
+        use_hybrid=False,
+    )
+    single_no_bv = retrieve(
+        query,
+        collection,
+        body_vectors=None,
+        use_dual_embedding=False,
+        use_hybrid=False,
+    )
+
+    assert [(r.source, r.section, r.score) for r in single_with_bv] == [
+        (r.source, r.section, r.score) for r in single_no_bv
+    ], "use_dual_embedding=False with body_vectors must match pure single-vector retrieval"
+
+
+def test_no_negative_scores(
+    dual_embed_collection_and_vectors: tuple[chromadb.Collection, dict],
+) -> None:
+    """All scores are ≥ 0 regardless of whether dual embedding is on or off."""
+    collection, body_vectors = dual_embed_collection_and_vectors
+    for use_dual in (True, False):
+        results = retrieve(
+            "Alphazol storage temperature",
+            collection,
+            body_vectors=body_vectors,
+            use_dual_embedding=use_dual,
+            use_hybrid=False,
+        )
+        scores = [r.score for r in results]
+        assert all(s >= 0.0 for s in scores), (
+            f"Negative score(s) with use_dual_embedding={use_dual}: {scores}"
+        )

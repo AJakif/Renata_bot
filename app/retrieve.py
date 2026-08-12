@@ -1,9 +1,12 @@
 """Dense and hybrid (BM25 + dense) retrieval over a ChromaDB collection."""
 
+import functools
 from dataclasses import dataclass
 
 import chromadb
 import chromadb.api
+import numpy as np
+import numpy.typing as npt
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 from rank_bm25 import BM25Okapi
 
@@ -23,10 +26,13 @@ class ChunkResult:
 
     source: str  # PDF filename including .pdf extension
     section: str  # Exact section heading
-    # Cosine similarity ∈ [0, 1] against the *indexed* vector — header+body when
-    # contextual headers are enabled, body-only otherwise. NOT yet the body-only
-    # gating score the architecture calls for; that split (dual embedding, D6 in
-    # PLAN_AND_DECISIONS.md) is a separate, not-yet-implemented slice.
+    # Cosine similarity ∈ [0, 1]. When dual embedding is enabled (D6, architecture
+    # default), this is the body-only cosine — the value the similarity gate
+    # thresholds on and the value reported as the citation score.  When dual
+    # embedding is disabled (single-vector baseline mode, DUAL_EMBEDDING=false),
+    # this is the cosine against the indexed vector — header+body when contextual
+    # headers are on.  In both modes scores are clamped to [0, 1] and sorted
+    # descending (D7).
     score: float
     body: str  # Section text
 
@@ -47,6 +53,37 @@ def _embed_text(
         header = _contextual_header(chunk, product_infos[chunk.source])
         return f"{header}\n{chunk.body}"
     return chunk.body
+
+
+@functools.lru_cache(maxsize=1)
+def _get_embedding_function() -> DefaultEmbeddingFunction:
+    """Return the shared MiniLM embedding function (ONNX model loaded once per process)."""
+    return DefaultEmbeddingFunction()
+
+
+def build_body_vectors(
+    chunks: list[Chunk],
+    embedding_function: DefaultEmbeddingFunction | None = None,
+) -> dict[str, npt.NDArray[np.float32]]:
+    """Embed body-only text for every chunk; return a dict keyed by chunk id.
+
+    The chunk id format is ``"source::section"``, matching the Chroma collection ids.
+    Body-only embeddings intentionally omit the contextual header, regardless of the
+    CONTEXTUAL_HEADERS flag — these vectors are used for gating and citation scoring
+    (D6/D7), not for retrieval ranking.
+
+    MiniLM output is L2-normalised, so dot-product over these vectors equals cosine
+    similarity without a separate normalisation step.
+    """
+    if not chunks:
+        return {}
+    ef = embedding_function if embedding_function is not None else _get_embedding_function()
+    bodies = [c.body for c in chunks]
+    raw = ef(bodies)
+    return {
+        f"{c.source}::{c.section}": np.array(vec, dtype=np.float32)
+        for c, vec in zip(chunks, raw, strict=True)
+    }
 
 
 def build_collection(
@@ -78,7 +115,7 @@ def build_collection(
     distance values are NOT cosine similarities — the threshold logic breaks
     silently.
     """
-    ef = DefaultEmbeddingFunction()
+    ef = _get_embedding_function()
     # Guarantee the collection exists first so delete_collection never raises,
     # then drop it and recreate clean.  The get_or_create call carries no data;
     # the real config (cosine space, embedding function) is set on create_collection.
@@ -153,15 +190,15 @@ def _rrf_fuse(ranked_lists: list[list[str]], top_k: int) -> list[str]:
 
 
 def _retrieve_dense(
-    query: str,
+    query_embedding: npt.NDArray[np.float32],
     collection: chromadb.Collection,
     n_total: int,
     top_k: int,
 ) -> list[ChunkResult]:
-    """Dense-only retrieval — original behaviour, unchanged."""
+    """Dense-only retrieval using a pre-computed query embedding."""
     n = min(top_k, n_total)
     results = collection.query(
-        query_texts=[query],
+        query_embeddings=[query_embedding],  # type: ignore[arg-type]  # Chroma stubs too narrow
         n_results=n,
         include=["documents", "metadatas", "distances"],
     )
@@ -191,6 +228,7 @@ def _retrieve_dense(
 
 def _retrieve_hybrid(
     query: str,
+    query_embedding: npt.NDArray[np.float32],
     collection: chromadb.Collection,
     bm25: BM25Okapi,
     bm25_chunk_ids: list[str],
@@ -207,7 +245,7 @@ def _retrieve_hybrid(
     # Fetch all chunks — full corpus is small (35 items); this gives us cosine
     # scores for every candidate including those only BM25 surfaces.
     results = collection.query(
-        query_texts=[query],
+        query_embeddings=[query_embedding],  # type: ignore[arg-type]  # Chroma stubs too narrow
         n_results=n_total,
         include=["documents", "metadatas", "distances"],
     )
@@ -275,20 +313,69 @@ def retrieve(
     bm25: BM25Okapi | None = None,
     bm25_chunk_ids: list[str] | None = None,
     use_hybrid: bool = True,
+    body_vectors: dict[str, npt.NDArray[np.float32]] | None = None,
+    use_dual_embedding: bool = True,
 ) -> list[ChunkResult]:
     """Return up to top_k chunks sorted by cosine similarity descending.
 
+    The query is encoded once per call via the shared MiniLM singleton and the
+    resulting vector is reused for both Chroma retrieval and body-only similarity
+    gating — no second encode pass.
+
     When ``use_hybrid`` is True and a BM25 index is supplied, fuses dense and
     keyword rankings with Reciprocal Rank Fusion before selecting the top_k
-    results.  The returned ``ChunkResult.score`` is always the cosine similarity
-    — RRF scores are ordering-only and never leave this function (D7).
+    results.  When ``use_hybrid`` is False or no BM25 index is supplied, falls
+    back to pure dense retrieval.
 
-    When ``use_hybrid`` is False, or no BM25 index is supplied, falls back to
-    pure dense retrieval (identical to the pre-hybrid behaviour).
+    When ``use_dual_embedding`` is True and ``body_vectors`` is non-empty,
+    rescores each result using body-only cosine similarity (D6/D7): the reported
+    ``ChunkResult.score`` is the body-only cosine, clamped to [0, 1], and results
+    are re-sorted by it descending.  This is the architecture default.
+
+    When ``use_dual_embedding`` is False or ``body_vectors`` is empty/None, the
+    reported score stays the indexed-vector cosine (single-vector baseline mode,
+    for measuring whether dual embedding is worth keeping).
     """
     n_total = collection.count()
     if n_total == 0:
         return []
+
+    # Encode the query once; reuse for Chroma retrieval and body-only dot products.
+    ef = _get_embedding_function()
+    query_embedding: npt.NDArray[np.float32] = np.array(ef([query])[0], dtype=np.float32)
+
     if use_hybrid and bm25 is not None and bm25_chunk_ids is not None:
-        return _retrieve_hybrid(query, collection, bm25, bm25_chunk_ids, n_total, top_k)
-    return _retrieve_dense(query, collection, n_total, top_k)
+        results = _retrieve_hybrid(
+            query, query_embedding, collection, bm25, bm25_chunk_ids, n_total, top_k
+        )
+    else:
+        results = _retrieve_dense(query_embedding, collection, n_total, top_k)
+
+    # Dual-embedding rescoring: replace indexed-vector cosine with body-only cosine.
+    if use_dual_embedding and body_vectors:
+        rescored: list[ChunkResult] = []
+        for r in results:
+            chunk_id = f"{r.source}::{r.section}"
+            bv = body_vectors.get(chunk_id)
+            if bv is not None:
+                # MiniLM output is L2-normalised → dot product == cosine similarity.
+                # Clamp: cosine can be genuinely negative for dissimilar text (not
+                # just FP rounding) — never report a negative citation score (D7).
+                cosine = max(0.0, float(np.dot(query_embedding, bv)))
+                cosine = round(cosine, 6)
+            else:
+                # Unreachable in practice: build_body_vectors and build_collection
+                # key off the same chunks with the same "source::section" id, so
+                # every retrieved id has a body vector. Fail loud rather than
+                # silently reporting the inflated header+body cosine (D7).
+                raise KeyError(
+                    f"No body-only vector for retrieved chunk {chunk_id!r} — "
+                    "body_vectors and the collection were built from different chunk sets."
+                )
+            rescored.append(
+                ChunkResult(source=r.source, section=r.section, score=cosine, body=r.body)
+            )
+        rescored.sort(key=lambda x: (-x.score, x.section))
+        return rescored
+
+    return results
