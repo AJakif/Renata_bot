@@ -572,3 +572,53 @@ def test_scope_filter_no_product_named_not_filtered(
     assert isinstance(data["citations"], list)
     for citation in data["citations"]:
         assert citation["source"].endswith(".pdf")
+
+
+# -- D14: per-product attribution tests --------------------------------------
+
+
+def test_unscoped_question_cites_both_products_sorted_descending(
+    multi_product_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unscoped query: citations span both products and are sorted by score descending.
+
+    With SIMILARITY_THRESHOLD=0 and no product name in the question, the scope
+    filter is a no-op and chunks from all products reach the generator.
+    stub_generate cites every chunk it sees, so both sources appear in the
+    final citations list, sorted by cosine descending (D14 / issue #8).
+    """
+    monkeypatch.setattr(main_module, "SIMILARITY_THRESHOLD", 0.0)
+    resp = multi_product_client.post("/ask", json={"question": "How should I store this medicine?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    sources = {c["source"] for c in data["citations"]}
+    assert any("doxicap" in s for s in sources), (
+        f"Expected Doxicap citations in unscoped query; got sources: {sources}"
+    )
+    assert any("fenadin" in s for s in sources), (
+        f"Expected Fenadin citations in unscoped query; got sources: {sources}"
+    )
+    scores = [c["score"] for c in data["citations"]]
+    assert scores == sorted(scores, reverse=True), (
+        f"Citations not sorted by score descending: {scores}"
+    )
+
+
+def test_single_product_question_unaffected_by_multi_product_rule(
+    multi_product_client: TestClient,
+) -> None:
+    """Naming one product in the question limits citations to that product only.
+
+    The per-product prompt rule (D14) must not interfere with single-product
+    queries: after the scope filter reduces chunks to one source, unique_sources
+    has cardinality 1 and multi_product_rule is the empty string.
+    """
+    resp = multi_product_client.post("/ask", json={"question": "What is Fenadin used for?"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["citations"], "Expected at least one citation for a single-product question"
+    for citation in data["citations"]:
+        assert "fenadin" in citation["source"].lower(), (
+            f"Expected only Fenadin citations; got {citation['source']!r}"
+        )

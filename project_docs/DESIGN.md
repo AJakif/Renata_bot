@@ -63,9 +63,9 @@ confusion**, not chunk sizing. Two measurements drove the design:
 
 | Section | mean same-section cross-drug cosine (TF-IDF) |
 |---|---|
-| §6 How to store | **«0.82»** |
-| §3 How to take | «0.41» |
-| others | ≤ «0.15» |
+| §6 How to store | **0.61** |
+| §3 How to take | 0.32 |
+| others | ≤ 0.30 |
 
 And decisively: **22 of 30 chunks never name their own drug.** The brand appears
 in the heading and never again in the body. Chunk text alone therefore carries

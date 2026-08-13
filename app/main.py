@@ -233,14 +233,28 @@ async def ask(
     if best_score < SIMILARITY_THRESHOLD:
         return AskResponse(answer=REFUSAL_MESSAGE, citations=[])
 
+    source_to_brand: dict[str, str] = {pi.source: pi.brand for pi in product_infos}
     context_blocks = "\n\n".join(
-        f"[{i + 1}] ({r.source} — {r.section})\n{r.body}" for i, r in enumerate(chunks)
+        f"[{i + 1}] ({source_to_brand.get(r.source, r.source)} — {r.section})\n{r.body}"
+        for i, r in enumerate(chunks)
+    )
+    unique_sources = {r.source for r in chunks}
+    # D14: when chunks span more than one product, instruct the LLM to attribute
+    # each answer by product name.  Single-product queries are unaffected.
+    multi_product_rule = (
+        "If the passages above come from more than one product, structure your answer by "
+        "product: begin each product's section with its name followed by a colon "
+        "(e.g. 'Doxicap: ...') and answer independently for that product. "
+        "Do not compare, rank, or contrast products.\n\n"
+        if len(unique_sources) > 1
+        else ""
     )
     prompt = (
         "You are a medicine information assistant. Answer the question using ONLY the numbered "
         "context passages below. Use no outside knowledge.\n\n"
         f"{context_blocks}\n\n"
         f"Question: {body.question}\n\n"
+        f"{multi_product_rule}"
         "Respond with a single JSON object (no other text) matching this schema:\n"
         '{"answered": bool, "answer": string, "chunk_ids": [int, ...]}\n'
         "where chunk_ids lists the 1-based numbers of the passages you used. "
