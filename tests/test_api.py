@@ -622,3 +622,85 @@ def test_single_product_question_unaffected_by_multi_product_rule(
         assert "fenadin" in citation["source"].lower(), (
             f"Expected only Fenadin citations; got {citation['source']!r}"
         )
+
+
+# -- Fix 1 regression: DUAL_EMBEDDING default is False (D6 kill criterion) ----
+
+
+def test_dual_embedding_default_is_false() -> None:
+    """DUAL_EMBEDDING must default to False when the env var is not set.
+
+    D6 kill criterion was triggered: the single-vector baseline outperforms
+    dual embedding on every eval metric.  Before the fix the default was 'true',
+    which caused a false refusal on 'How should I store Rolip?' because the
+    body-only rescore dropped below the similarity gate threshold.
+
+    This test checks the module constant directly without reloading — safe
+    as long as DUAL_EMBEDDING is not set in the test environment (which it
+    must not be, since tests never set it).
+    """
+    import os
+
+    assert os.getenv("DUAL_EMBEDDING") is None, (
+        "DUAL_EMBEDDING env var must not be set in the test environment"
+    )
+    assert main_module.DUAL_EMBEDDING is False, (
+        "DUAL_EMBEDDING should default to False (kill criterion D6 was triggered); "
+        f"got {main_module.DUAL_EMBEDDING!r}"
+    )
+
+
+# -- Fix 2 regression: _retrieve is offloaded to asyncio.to_thread ------------
+
+
+def test_retrieve_is_offloaded_to_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_retrieve must be dispatched via asyncio.to_thread, not called directly on the event loop.
+
+    Before the fix asyncio.to_thread was called once per request (generator only).
+    After the fix it is called twice: once for retrieve, once for generate.
+
+    Uses an isolated MagicMock collection (not EphemeralClient) so the Rust
+    backend UUID-not-found issue that plagues the session fixture cannot occur.
+    The spy runs callables synchronously to avoid worker-thread GIL/backend issues;
+    we are counting dispatch calls, not validating threading behaviour.
+    """
+    from unittest.mock import MagicMock, patch
+
+    # Empty mock collection — retrieve() returns [] on count()==0, no Rust backend involved.
+    mock_col = MagicMock()
+    mock_col.count.return_value = 0
+
+    call_count: list[int] = [0]
+
+    async def counting_to_thread(func: object, *args: object, **kwargs: object) -> object:
+        """Spy: count calls to asyncio.to_thread; run callables synchronously."""
+        call_count[0] += 1
+        if args or kwargs:
+            return func(*args, **kwargs)  # type: ignore[operator]
+        return func()  # type: ignore[operator]
+
+    def _get_col() -> chromadb.Collection:
+        return mock_col  # type: ignore[return-value]
+
+    def _get_gen() -> Generator:
+        return stub_generate
+
+    def _get_bv() -> dict[str, npt.NDArray[np.float32]]:
+        return {}
+
+    app.dependency_overrides[get_collection] = _get_col
+    app.dependency_overrides[get_generator] = _get_gen
+    app.dependency_overrides[get_body_vectors] = _get_bv
+    monkeypatch.setattr(main_module, "SIMILARITY_THRESHOLD", 0.0)
+    try:
+        with patch("asyncio.to_thread", counting_to_thread):
+            tc = TestClient(app, raise_server_exceptions=True)
+            resp = tc.post("/ask", json={"question": "What is Doxicap used for?"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert call_count[0] >= 2, (
+        f"Expected asyncio.to_thread to be called at least twice (retrieve + generate); "
+        f"got {call_count[0]} call(s)"
+    )

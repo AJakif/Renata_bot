@@ -209,3 +209,32 @@ def test_make_generator_unknown_provider_raises(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("LLM_PROVIDER", "openai")
     with pytest.raises(ValueError, match="openai"):
         make_generator()
+
+
+# -- Fix 4 regression: Ollama payload includes JSON-schema constrained decoding -
+
+
+def test_ollama_payload_includes_format_schema() -> None:
+    """OllamaGenerator must send 'format': GenerationResult.model_json_schema() (D24).
+
+    Before the fix the payload had no 'format' field, so Ollama decoded freely
+    and the cite-or-refuse layer could receive invalid JSON at 3B model scale.
+    After the fix, constrained decoding is actually enforced — not just instructed
+    via prompt — matching the architecture claim in D24 / DESIGN.md §5.
+    """
+    from app.generate import GenerationResult
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"response": '{"answered": true, "answer": "ok", "chunk_ids": []}'}
+    mock_resp.raise_for_status.return_value = None
+
+    with patch("httpx.post", return_value=mock_resp) as mock_post:
+        gen = OllamaGenerator(host="http://localhost:11434", model="qwen2.5:3b", keep_alive="5m")
+        gen("some prompt")
+
+    _, call_kwargs = mock_post.call_args
+    payload = call_kwargs["json"]
+    assert "format" in payload, "Payload must include 'format' for constrained decoding (D24)"
+    assert payload["format"] == GenerationResult.model_json_schema(), (
+        "format field must equal GenerationResult.model_json_schema()"
+    )

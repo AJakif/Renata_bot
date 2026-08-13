@@ -44,14 +44,17 @@ HYBRID_RETRIEVAL: bool = os.getenv("HYBRID_RETRIEVAL", "true").lower() not in (
     "false",
     "no",
 )
-DUAL_EMBEDDING: bool = os.getenv("DUAL_EMBEDDING", "true").lower() not in (
+DUAL_EMBEDDING: bool = os.getenv("DUAL_EMBEDDING", "false").lower() not in (
     "0",
     "false",
     "no",
 )
-# Provisional similarity gate threshold (layer 1 of grounding).  Sits in the measured
-# gap: on-topic body-only cosines 0.51–0.85, off-topic 0.01–0.18.  Formal calibration
-# against the 8-row eval set (D10) is pending — adjust via SIMILARITY_THRESHOLD env var.
+# Similarity gate threshold (layer 1 of grounding).  Calibrated to avoid
+# false-refusing answerable questions, which score 0.34–0.77 in no_dual mode (eval set D10).
+# NOTE: absent-topic and wrong-product refusals do NOT rely on this gate — measured
+# off-topic queries score 0.527–0.558, well above 0.35.  Those refusals come from
+# layers 3–4 (prompt constraint + cite-or-refuse id validation).  The gate's sole job
+# is preventing LLM calls when no relevant chunk exists.  Adjust via SIMILARITY_THRESHOLD.
 SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.35"))
 
 REFUSAL_MESSAGE: str = "I don't have enough information in the leaflets to answer that question."
@@ -237,15 +240,19 @@ async def ask(
     4. Call the injected generator.
     5. Return answer + citations sorted by body-only cosine descending.
     """
-    chunks = _retrieve(
-        body.question,
-        collection,
-        top_k=TOP_K,
-        bm25=_bm25_index,
-        bm25_chunk_ids=_bm25_chunk_ids,
-        use_hybrid=HYBRID_RETRIEVAL,
-        body_vectors=body_vectors if DUAL_EMBEDDING else None,
-        use_dual_embedding=DUAL_EMBEDDING,
+    # _retrieve() runs MiniLM inference and a ChromaDB query — both CPU-bound/blocking.
+    # Offload to a worker thread so the event loop remains free for concurrent requests.
+    chunks = await asyncio.to_thread(
+        lambda: _retrieve(
+            body.question,
+            collection,
+            top_k=TOP_K,
+            bm25=_bm25_index,
+            bm25_chunk_ids=_bm25_chunk_ids,
+            use_hybrid=HYBRID_RETRIEVAL,
+            body_vectors=body_vectors if DUAL_EMBEDDING else None,
+            use_dual_embedding=DUAL_EMBEDDING,
+        )
     )
     chunks = filter_by_product_scope(body.question, chunks, product_infos)
 

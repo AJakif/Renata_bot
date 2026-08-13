@@ -184,7 +184,7 @@ Citations are precise enough to verify: not "see the Maxpro leaflet" but
 **Contextual chunk headers**
 
 Chunk text is prefixed with brand, active ingredient and section name *before
-embedding*. This is not an optimisation: 19 of 24 chunk bodies never name their
+embedding*. This is not an optimisation: 22 of 30 chunk bodies never name their
 own product, so without the prefix the chunk text carries no signal on the
 product axis and retrieval is close to a coin flip across four candidates.
 

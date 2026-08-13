@@ -5,7 +5,7 @@ Grounded RAG service over Renata medicine leaflets. `POST /ask` → answer + cit
 ## Requirements
 
 - Python 3.13+
-- `pdftotext` (poppler) for ingestion
+- No system binaries required — PDF parsing uses `pypdf` (pure Python)
 - Ollama 0.32+ with `qwen2.5:3b` pulled (`ollama pull qwen2.5:3b`), **or** a Groq API key
 
 ## Setup

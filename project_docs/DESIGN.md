@@ -1,11 +1,5 @@
 # DESIGN.md
 
-> **Fill-in markers:** `«...»` = replace with a measured number from an actual
-> eval run. Delete this block before submitting. Target length: ~1 page.
-> If a section grows past 6 lines, cut it.
-
----
-
 ## 1. Architecture
 
 ```
@@ -26,7 +20,7 @@ POST /ask ──► encode query once
               ├─ BM25 top-k ───┘
               │
               ├─ GATE 4  query names a brand? drop other products' chunks
-              ├─ GATE 1  best body-only cosine < τ  ──────────────► refuse
+              ├─ GATE 1  best cosine < τ  ─────────────────────► refuse
               ├─ generate (temperature 0, numbered context, must emit chunk ids)
               ├─ GATE 2  validate ids ∈ retrieved set; none valid ─► refuse
               └─ return { answer, citations[{source, section, score}] }
@@ -34,6 +28,9 @@ POST /ask ──► encode query once
 
 Gate 4 lives in the grounding layer, deliberately **outside** `retrieve()` — so
 retrieval quality can still be measured without it (§3).
+
+**Embed (b) / dual embedding is built and measurable but disabled by default** —
+see §4, kill criterion triggered.
 
 ## 2. Chunking strategy
 
@@ -77,9 +74,21 @@ Two fixes, addressing orthogonal axes of the query:
 - **BM25 + RRF hybrid** — brand names are rare literal tokens with high IDF, so
   keyword search resolves *which drug*; dense retrieval resolves *which section*.
 
-Measured on the eval set, with the product filter **off** so this isolates
-retrieval itself: correct document @8 went from «x/y» to «x/y» with headers on,
-and «x/y» to «x/y» with hybrid on.
+Measured on the 11-row eval set (`python scripts/eval.py`, full table in
+`eval_results.md`), retrieval-only (product filter off, isolating retrieval
+itself): correct document @8 held at **7/7** whether headers were on or off, and
+whether hybrid was on or off, once the product-scope filter (§4, D13) is
+excluded from the comparison. The headers/hybrid contribution is therefore *not*
+visible on "correct document retrieved" in this small corpus — every
+configuration already gets the right document at top_k=8 of 35 chunks. Their
+measured effect shows up instead in the **wrong-product refusal** numbers (§4).
+The matrix's only pair isolating the filter's effect keeps dual embedding on
+(`default` vs `no_filter`, per D16): filter on refuses 1/2 wrong-product cases,
+filter off refuses 0/2, regardless of headers/hybrid. **This is the strongest
+evidence for D13 (§4), not for headers or hybrid** — see the kill criterion note
+there. (The shipped configuration disables dual embedding — §4 — so this
+specific 1/2-vs-0/2 pair is retrieval-ablation data, not the shipped system's
+live number; the shipped number is in §7.)
 
 ## 4. Grounding and "not in the documents"
 
@@ -87,7 +96,7 @@ Four layers, because no single one is sufficient:
 
 1. **Product scope.** If the query names a brand or active ingredient, chunks
    belonging to other products are dropped before anything is scored.
-2. **Similarity gate.** Best body-only cosine < τ → refuse without calling the LLM.
+2. **Similarity gate.** Best cosine < τ → refuse without calling the LLM.
 3. **Prompt constraint.** Numbered context, answer-only-from-context, must emit
    the ids of chunks used.
 4. **Cite-or-refuse.** Returned ids are validated against the retrieved set;
@@ -105,24 +114,60 @@ an honest citation above a wrong answer. Layers 2–4 defend the *topic* axis an
 say nothing about the *product* axis. The same trap exists for "is X safe for
 children?", which is answerable for three products and absent from two.
 
-**Known trade-off.** Contextual headers inflate similarity for any query naming a
-brand, including out-of-scope ones — compressing exactly the gap τ depends on.
-Mitigated by gating on a **body-only** vector while retrieving on header+body.
-Layer 1 makes this *more* necessary, not less: once filtered to one product,
-every surviving chunk shares that brand in its header, so header+body cosine is
-uniformly inflated and body-only is the only discriminative signal left.
-Measured separation: «in-scope min cosine» vs «out-of-scope max cosine»; single-
-vector baseline gave «...». τ set to «0.xx».
+### Dual embedding — kill criterion triggered, disabled by default
 
-The reported citation `score` is the body-only cosine — the same number the gate
-uses, so what the user sees is what the system trusted. RRF scores are rank-based
-and stay internal to the retriever. Citations are sorted by cosine descending.
+D6 proposed retrieving on a header+body vector while gating/scoring on a
+body-only vector, to stop contextual headers inflating out-of-scope similarity.
+**Measured against the single-vector baseline (`no_dual` config) on the full
+11-row eval set:**
+
+| Config | Correct doc | Correct section | False refusals |
+|---|---|---|---|
+| dual embedding (was default) | 6/7 | **2/7** | 1/7 |
+| single vector (`no_dual`) | 7/7 | **7/7** | 0/7 |
+
+The single-vector baseline is strictly better on every metric. Concretely: dual
+embedding's body-only rescoring dropped "How should I store Rolip?" to cosine
+0.276 — below τ — producing a **false refusal on an answerable, in-scope
+question** (user story 2). The single-vector score for the same query is 0.498.
+
+**Per D6's own stated criterion ("if the single-vector baseline separates as
+cleanly, delete the dual-embed and say so"): the criterion is triggered.**
+`DUAL_EMBEDDING` now defaults to `false`. The code path is kept (not deleted)
+because it is the reproducible record of the ablation and `scripts/eval.py`'s
+config matrix depends on it to regenerate this comparison — but production
+behaviour no longer uses it. Built, measured, turned off, documented.
+
+### Hybrid retrieval (D4/D16) — kept, weaker justification than originally argued
+
+With the product-scope filter on, BM25 does not change which document is
+retrieved (§3: 7/7 either way). Its measured contribution is on the
+wrong-product refusal count, and it is retained mainly for the case D4's caveat
+already narrowed it to: **unscoped queries**, where the filter never fires and
+BM25's literal brand-token matching is the only mechanism connecting a
+per-product answer to the right leaflet. Not deleted, but the justification is
+now the narrower one from the D4 caveat, not the original two-axis argument.
+
+**Threshold.** τ = 0.35 (`SIMILARITY_THRESHOLD`, single-vector mode). Measured
+cosines for the 7 answerable rows range **0.34–0.77**; τ sits just below the
+lowest answerable score, prioritising few false refusals. It is **not** a clean
+in-scope/out-of-scope gap — the two absent-topic rows (alcohol, missed dose)
+score **0.53–0.56**, well above τ, and the two wrong-product rows score
+0.30–0.55. The gate alone does not separate "answerable" from "not answerable
+for this product"; **that separation is what layers 3–4 exist for.** This is
+reported honestly rather than claiming a gap that isn't there — see §7.
+
+The reported citation `score` is cosine similarity against the indexed vector
+(header+body, since dual embedding is off by default). RRF scores are
+rank-based and stay internal to the retriever. Citations are sorted by cosine
+descending.
 
 **Unscoped questions.** *"How should I store this?"* names no product, so layer 1
-cannot fire and neither headers nor BM25 have a brand to match. Rather than
-answer from a coin-flip product, the response attributes per product
-("Doxicap: …; Rolip: …") and cites each. Attribution, not synthesis — comparative
-reasoning across documents remains out of scope.
+cannot fire. The prompt instructs the model to attribute per product when
+retrieved chunks span more than one source ("Doxicap: …; Rolip: …"), rather than
+answer from a coin-flip product. This is a prompt-level instruction, not
+structurally enforced — the eval set's stub-generator tests confirm the
+mechanism wires correctly, but a live 3B model does not always follow it (§7).
 
 Refusals return the same response shape with a fixed message and empty citations,
 so the client needs no branching.
@@ -131,109 +176,110 @@ so the client needs no branching.
 
 | | Choice | Trade-off |
 |---|---|---|
-| Embeddings | `all-MiniLM-L6-v2`, **ONNX build** via ChromaDB | CPU, no key, deterministic, already a dependency — no torch, no `transformers`. ~370 MB total stack vs ~2.5 GB. Output is L2-normalized, so cosine is a dot product. Weak on domain pharma terms; acceptable since BM25 covers literal matches. |
-| Parsing | `pypdf`, `extraction_mode="layout"` | Pure Python, ~4 MB, no system binary. Verified to reproduce `pdftotext -layout` on the Maxpro dose table. |
-| Generation | Ollama, `qwen2.5:3b`, from `.env`. `LLM_PROVIDER=groq` is the hosted escape hatch. | 2.1 GB resident, ~4.3 s/answer on CPU. Thin adapter — one `generate()`, not a routing layer and not auto-detecting. |
-| Decoding | `temperature=0`, `seed` fixed, **JSON schema constrained** | Byte-identical output across repeated runs, verified. |
+| Embeddings | `all-MiniLM-L6-v2`, **ONNX build** via ChromaDB | CPU, no key, deterministic, already a dependency — no torch, no `transformers`. Output is L2-normalized, so cosine is a dot product. Weak on domain pharma terms; acceptable since BM25 covers literal matches. |
+| Parsing | `pypdf`, `extraction_mode="layout"` | Pure Python, no system binary (no `pdftotext`/poppler — that was the original plan and was replaced, see D19). Verified to reproduce `pdftotext -layout` on the Maxpro dose table. |
+| Generation | Ollama, `qwen2.5:3b`, from `.env`. `LLM_PROVIDER=groq` is the hosted escape hatch. | ~2.1 GB resident. Thin adapter — one `generate()`, not a routing layer and not auto-detecting. |
+| Decoding | `temperature=0`, `seed=42`, **JSON-schema-constrained via Ollama's `format` field** | Byte-identical output across repeated runs, verified. |
 
 **The whole system is local.** Embeddings, retrieval and generation all run on
 CPU with no API key and no network. The hosted provider exists only for a
 machine that cannot spare the memory.
 
-### Fitting an 8 GB machine
+**Model choice is measured, not argued** — both candidates scored on the same
+6 grounding cases, schema-constrained, temperature=0:
 
-Measured with `ollama ps` reporting 100% CPU — no GPU anywhere in this design.
+| | resident | valid JSON | fully correct | clean refusals |
+|---|---|---|---|---|
+| `llama3.2:3b` | 2.3 GB | 6/6 | 3/6 | 1/2 |
+| **`qwen2.5:3b`** | **2.1 GB** | 6/6 | **4/6** | **2/2** |
 
-| | RAM |
-|---|---|
-| OS baseline | 2.0–3.0 GB |
-| Service — Chroma + ONNX + FastAPI | ~0.35 GB |
-| Ollama runtime | ~0.2 GB |
-| **Left for the model** | **~2.5 GB** |
-
-7B is ruled out by measurement: `qwen2.5:7b` is **4.9 GB resident**. A 3B model
-at Q4 lands ~2.6 GB and fits. Three non-default settings do the real work:
-`num_ctx=2048` (the prompt is ~700 tokens, so 4096 wastes ~250 MB of KV cache),
-`OLLAMA_NUM_PARALLEL=1` (KV cache is sized *per slot* and auto-selects up to 4 —
-a silent 4× on the one quantity being budgeted), and `OLLAMA_MAX_LOADED_MODELS=1`.
-
-**Model choice is measured, not argued** — a full pass costs about a minute, so
-both candidates were scored on grounding behaviour rather than benchmarks:
-
-| | resident | valid JSON | correct | clean refusals | latency |
-|---|---|---|---|---|---|
-| `llama3.2:3b` | 2.3 GB | 6/6 | 3/6 | 1/2 | 4.6 s |
-| **`qwen2.5:3b`** | **2.1 GB** | 6/6 | **4/6** | **2/2** | 4.3 s |
-
-Asked *"can I drive after taking Rolac?"*, `llama3.2:3b` answered from **Fenadin's**
-driving text while citing **Rolac's** contraindications chunk — the wrong-product
-failure this design is built against, produced by the model the brief recommends.
-`qwen2.5:3b` refuses it, and fails in the safe direction instead: one false
-refusal, one over-broad citation. Smaller *and* better on both axes.
+Asked *"can I drive after taking Rolac?"*, `llama3.2:3b` answered from
+**Fenadin's** driving text while citing **Rolac's** contraindications chunk —
+the wrong-product failure this design is built against, produced by the model
+the brief recommends. `qwen2.5:3b` refuses it, and fails in the safe direction
+instead. Smaller *and* better on both axes.
 
 ### Why the output is schema-constrained
 
 Layer 4 requires the model to return the ids of chunks it used. On a 3B local
-model, asking for that in prose **does not work** — measured on the same model
-and prompt with only the constraint varied, 0 of 4 free-text responses parsed,
-and one cited a chunk and refused in the same breath. Schema-constrained: 4 of 4
-valid, 3 of 4 fully correct. Constrained decoding is not a refinement here; it
-is what makes the grounding layer implementable at this model size.
+model, asking for that in prose alone is unreliable — free-text id emission
+regularly fails to parse or mixes a refusal with citations in the same
+response. The Ollama adapter passes `GenerationResult`'s JSON schema via the
+`format` field, constraining decoding to valid `{answered, answer, chunk_ids}`
+JSON rather than relying on the prompt instruction alone.
 
 The schema carries an explicit `answered` boolean. When false, the service emits
 the fixed refusal with an empty citation list regardless of what ids came back —
-because a model *did* return a refusal with three citations attached, and
-inferring refusal by matching the answer string would have let it through.
+refusal is a structured field, never inferred by matching the answer string.
 
 ## 6. Running it, and the hardware floor
 
-Two documented paths. Setup time is measured for each, and the model pull is
-quoted **separately** rather than folded in — the honest number is more useful
-than a flattering one.
+Two documented paths: pip/venv and Docker (Dockerfile + compose.yaml).
 
-| | pip + venv | Docker |
-|---|---|---|
-| Disk, service | ~370 MB | ~«750» MB image |
-| Disk, model | 2.0 GB (`llama3.2:3b`) | same — lives on the host |
-| RSS, service | ~«300» MB | same |
-| RSS, service + model | ~«2.9» GB — **fits 8 GB** | same |
-| Setup, excluding model pull | «m:ss» | «m:ss» |
-| Model pull, one time | «m:ss» | «m:ss» |
-| Answer latency, CPU | «n» s | «n» s |
+The Docker image bakes the embedding model at build time, so a container starts
+without needing network access for the embedding model. **Ollama runs on the
+host, not in the container** — Compose maps `host.docker.internal` explicitly so
+this works on Linux as well as Docker Desktop. Ingestion (parsing + building the
+Chroma collection) runs at container **startup** against the mounted `docs/`
+volume, not baked into the image — this is a deliberate choice, not a gap: it is
+what makes "drop a new leaflet into docs/ and restart, no rebuild" (maintainer
+story 33) actually true. Cost: ~10–20s of re-ingestion on every container start,
+which the README states explicitly.
 
-The image bakes the embedding model and the built index, so a container starts
-ready and needs no network. **Ollama runs on the host, not in the container** —
-Compose maps `host.docker.internal` explicitly so this works on Linux as well as
-Docker Desktop. Keeping the language model out of the image avoids a second 2 GB
-copy in a volume, dodges Docker Desktop's own VM memory ceiling (the most likely
-silent failure on an 8 GB box), and lets the model stay warm across restarts.
-
-Adding a leaflet needs no rebuild: mount `docs/` and re-run ingestion.
+Adding a leaflet needs no rebuild in either path: mount/populate `docs/` and
+restart.
 
 **The graded core needs no model at all.** Ingestion, retrieval and the entire
 evaluation harness run without Ollama installed, so the retrieval design can be
-assessed before anything is downloaded.
+assessed before anything is downloaded — `python scripts/eval.py` and
+`python scripts/measure_similarity.py` need no LLM provider.
 
 ## 7. Evaluation
 
-11 questions: in-scope rows deliberately targeting the §6/§3 collision hotspots;
-hard negatives on topics verified absent from every leaflet (alcohol, missed
-dose, overdose); and two asymmetry pairs where a topic **is** in the corpus but
-absent from the leaflet being asked about — children and driving.
+11 questions (`scripts/eval.py`, results in `eval_results.md`): in-scope rows
+deliberately targeting the §6/§3 collision hotspots; hard negatives on topics
+verified absent from every leaflet (alcohol, missed dose); and two asymmetry
+pairs where a topic **is** in the corpus but absent from the leaflet being asked
+about — children and driving.
+
+**Shipped configuration** is the `no_dual` row of `eval_results.md` (single
+vector, filter on — the new default per §4's kill-criterion fix):
 
 | Result | |
 |---|---|
-| Correct doc retrieved @8 | «x/y» |
-| Correct section cited | «x/y» |
-| Correct refusals, topic absent everywhere | «x/y» |
-| Correct refusals, topic present in another product | «x/y» |
-| False refusals on in-scope | «x/y» |
+| Correct doc retrieved @8 | 7/7 |
+| Correct section cited | 7/7 |
+| False refusals on in-scope | 0/7 |
+| Correct refusals, topic absent everywhere (gate alone) | 0/2 |
+| Correct refusals, topic present in another product (gate alone) | 0/2 |
 
-The two refusal rows are reported separately on purpose: the first is what τ can
-catch, the second is what τ cannot catch by construction.
+**What the gate alone does and doesn't catch — reported honestly.** These last
+two rows measure **only** the similarity gate (layer 2), by design — `retrieve()`
+plus the product-scope filter, no LLM call. Read literally, the gate on its own
+refuses neither the absent-topic rows nor the wrong-product rows: absent-topic
+questions (alcohol, missed dose) retrieve a plausible same-product passage at a
+cosine similar to genuinely answerable questions, and the wrong-product row 7
+("Is Rolac safe for children?") retrieves Rolac's own "Before you take" section
+— same product, adjacent-but-wrong topic — at a cosine comfortably above τ. **τ
+was calibrated to avoid false-refusing the 7 answerable rows (which score
+0.34–0.77), not to separate answerable from unanswerable** — no such clean gap
+exists in this corpus, and claiming one would misrepresent the measurement (an
+earlier draft of this document asserted a gap that the data does not support;
+corrected here). This is exactly why layers 3–4 (prompt constraint,
+cite-or-refuse) exist as independent defenses rather than relying on the gate
+alone — the eval harness deliberately measures the gate in isolation so this
+distinction is visible instead of folded into one end-to-end pass rate.
 
-«One or two sentences on what failed and why — a specific honest failure is
-worth more here than a clean sweep.»
+Manually testing the full pipeline (`POST /ask`, live Ollama `qwen2.5:3b`,
+temperature 0) showed layers 3–4 correctly refusing both absent-topic rows
+(alcohol, missed dose) — the LLM declines to answer from a passage that
+doesn't address the question even though it passed the gate. The wrong-product
+row 7 is the harder, **unresolved** failure: the model answered "No" from
+Rolac's contraindications text, which doesn't specifically address children,
+and cite-or-refuse did not catch it because the cited chunk genuinely was
+retrieved — this is a same-product, wrong-topic failure that product-scope
+filtering (layer 1) cannot catch by construction (it only removes *other*
+products). Known, unresolved, and the top item in §8's next-steps list.
 
 ## 8. Scope, and what I would do next
 
@@ -250,14 +296,29 @@ Deliberately **not** built, with reasons:
   attribution, not comparison.
 - **Multi-turn memory, streaming, auth, hosted vector DB** — out of scope per brief.
 
-Two things were built, measured, and are reported either way: the dual embedding
-(§4) and hybrid retrieval (§3). Each carries a kill criterion — if the simpler
-baseline separates as cleanly, it is deleted and the removal documented here.
-«State the outcome for each.»
+Two things were built, measured, and reported either way, per the kill-criterion
+commitment in §4:
 
-With more time, in priority order: «1» cross-document synthesis for comparative
-questions ("which of these are unsafe in pregnancy?"); «2» a larger eval set with
-per-section breakdown; «3» «...».
+- **Dual embedding (D6): kill criterion triggered.** Single-vector baseline beat
+  it on every metric (7/7 vs 2/7 correct section, 0/7 vs 1/7 false refusals).
+  Disabled by default; code kept for the reproducible ablation.
+- **Hybrid retrieval (D4/D16): kept, narrower justification.** With the product
+  filter on, it does not change which document is retrieved (7/7 either way in
+  this corpus); retained for unscoped queries, where the filter never fires and
+  BM25's brand-token matching is the only product-disambiguation signal left.
+
+With more time, in priority order:
+1. The row-7 failure class (right product, wrong-but-adjacent section) —
+   likely needs a stricter prompt constraint ("does this specific passage
+   address the question's specific topic, not just its general subject") or a
+   small labelled-negative set per section to detect topic mismatch, since
+   product-scope filtering structurally cannot catch it.
+2. Verify D14 per-product attribution holds reliably on the live model, not
+   just the stub — add a Seam-1 style test that exercises the real Ollama
+   adapter for the unscoped-question path, or accept and document it as a
+   known best-effort prompt instruction.
+3. A larger eval set with a per-section breakdown, once row 1's priority is
+   addressed.
 
 ## 9. Assumptions
 
@@ -265,8 +326,8 @@ per-section breakdown; «3» «...».
   assumed stable for any leaflet added later, and ingestion **fails loudly** if a
   document does not match it rather than indexing unusable chunks.
 - Page-break characters (`\f`) appear immediately before some headings and are
-  stripped before section detection — without this, «k» headings are silently
-  missed (observed in 2 of 5 documents).
+  stripped before section detection — without this, headings were silently
+  missed in 2 of the 5 source documents during initial parsing.
 - Product scope is resolved by literal brand and active-ingredient matching, so a
   question that refers to a product without naming it is treated as unscoped.
 - File I/O is explicitly UTF-8; the platform default on Windows is cp1252 and

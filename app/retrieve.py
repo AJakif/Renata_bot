@@ -218,7 +218,7 @@ def _retrieve_dense(
             ChunkResult(
                 source=str(meta["source"]),
                 section=str(meta["section"]),
-                score=round(1.0 - float(dist), 6),
+                score=round(max(0.0, min(1.0, 1.0 - float(dist))), 6),
                 body=doc,
             )
         )
@@ -267,7 +267,7 @@ def _retrieve_hybrid(
         if meta is None:
             continue
         chunk_id = f"{meta['source']}::{meta['section']}"
-        cosine_by_id[chunk_id] = round(1.0 - float(dist), 6)
+        cosine_by_id[chunk_id] = round(max(0.0, min(1.0, 1.0 - float(dist))), 6)
         doc_by_id[chunk_id] = doc
         source_by_id[chunk_id] = str(meta["source"])
         section_by_id[chunk_id] = str(meta["section"])
