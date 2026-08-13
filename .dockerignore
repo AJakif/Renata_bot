@@ -1,0 +1,16 @@
+.git/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+chroma_db/
+project_docs/
+docs/
+.env
+.env.*
+tests/
+scripts/

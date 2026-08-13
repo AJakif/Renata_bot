@@ -1,0 +1,27 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # LLM provider: 'ollama' (default, requires host daemon) or 'groq'.
+      LLM_PROVIDER: ollama
+      LLM_MODEL: qwen2.5:3b
+      # Reach the Ollama daemon running on the host machine.
+      # Docker Desktop (Windows/Mac) resolves host.docker.internal automatically;
+      # native Linux Docker Engine requires the extra_hosts entry below.
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_KEEP_ALIVE: 5m
+      # Uncomment for Groq instead of Ollama:
+      # LLM_PROVIDER: groq
+      # GROQ_API_KEY: ""
+      # LLM_MODEL: llama-3.1-8b-instant
+    extra_hosts:
+      # Maps host.docker.internal → host gateway on Linux Docker Engine.
+      # Harmless on Docker Desktop (the name already resolves there).
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Bind-mount the local docs/ directory so the app ingests the real leaflets
+      # on startup.  To index a new leaflet: add the PDF here, then restart the
+      # container — no image rebuild required.
+      - ./docs:/app/docs:ro
