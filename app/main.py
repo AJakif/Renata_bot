@@ -1,5 +1,6 @@
 """FastAPI application — POST /ask and static UI."""
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncGenerator
@@ -10,16 +11,22 @@ from typing import Annotated
 import chromadb
 import numpy as np
 import numpy.typing as npt
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 
-from app.generate import Generator, parse_generation_result, stub_generate
+from app.generate import Generator, ProviderError, make_generator, parse_generation_result
 from app.parser import Chunk, ProductInfo, extract_product_info, parse_pdf
 from app.retrieve import build_bm25_index, build_body_vectors, build_collection
 from app.retrieve import retrieve as _retrieve
 from app.scope import filter_by_product_scope
+
+# Load .env after all imports but before any os.getenv() constant definitions.
+# Local app imports don't call os.getenv at import time, so their position
+# relative to load_dotenv() does not affect the values they see.
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +68,10 @@ _EXPECTED_SECTIONS_PER_DOC = 6
 # app.dependency_overrides[get_collection].
 _collection: chromadb.Collection | None = None
 
+# Active LLM generator constructed from LLM_PROVIDER env var during lifespan.
+# Overridden in tests via app.dependency_overrides[get_generator].
+_generator: Generator | None = None
+
 # BM25 index and parallel chunk-id list built at startup alongside the Chroma
 # collection.  Both are None/empty when HYBRID_RETRIEVAL=false or in tests that
 # bypass lifespan — retrieve() degrades to dense-only when bm25 is None.
@@ -97,11 +108,13 @@ def get_collection() -> chromadb.Collection:
 def get_generator() -> Generator:
     """FastAPI dependency that returns the active LLM generator.
 
-    Override this in tests via ``app.dependency_overrides[get_generator]``.
-    In production, read ``LLM_PROVIDER`` here and return the real adapter
-    (added in a later slice).
+    The generator is constructed once during lifespan startup from the
+    LLM_PROVIDER env var.  Override in tests via
+    ``app.dependency_overrides[get_generator]``.
     """
-    return stub_generate
+    if _generator is None:
+        raise RuntimeError("Generator not initialized — server startup failed")
+    return _generator
 
 
 def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
@@ -111,6 +124,11 @@ def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
     or incomplete data.  parse_pdf already validates each document individually;
     this aggregates across all documents.
     """
+    if not pdf_paths:
+        raise RuntimeError(
+            f"Startup assertion failed: no PDFs found in {DOCS_DIR}.  "
+            "Check that docs/ is mounted/populated."
+        )
     expected_total = len(pdf_paths) * _CHUNKS_PER_DOC
     if len(chunks) != expected_total:
         raise RuntimeError(
@@ -136,7 +154,8 @@ def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     """Parse all PDFs in DOCS_DIR, embed them, and initialise the collection."""
-    global _collection, _product_infos, _bm25_index, _bm25_chunk_ids, _body_vectors
+    global _collection, _product_infos, _bm25_index, _bm25_chunk_ids, _body_vectors, _generator
+    _generator = make_generator()
     chunks: list[Chunk] = []
     pdf_paths = sorted(DOCS_DIR.glob("*.pdf"))
     for pdf in pdf_paths:
@@ -162,6 +181,7 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
         _body_vectors = build_body_vectors(chunks)
     yield
     _collection = None
+    _generator = None
     _bm25_index = None
     _bm25_chunk_ids = []
     _body_vectors = {}
@@ -262,7 +282,13 @@ async def ask(
         "and chunk_ids to []."
     )
 
-    raw = generator(prompt, temperature=0.0)
+    try:
+        # generator() is a synchronous httpx call (up to `timeout` seconds); run it off
+        # the event loop so a slow/hung provider doesn't stall other in-flight requests.
+        raw = await asyncio.to_thread(generator, prompt, temperature=0.0)
+    except ProviderError as exc:
+        logger.error("LLM provider error — returning refusal: %s", exc)
+        return AskResponse(answer=REFUSAL_MESSAGE, citations=[])
     result = parse_generation_result(raw)
     if result is None or not result.answered:
         return AskResponse(answer=REFUSAL_MESSAGE, citations=[])
