@@ -4,7 +4,9 @@ The Generator Protocol is the single injection point for the LLM provider.
 Select the active adapter via LLM_PROVIDER env var ('ollama' | 'groq');
 call make_generator() once from the application lifespan.
 
-Fixed engineering constants (not env-configurable per D9):
+Engineering defaults (D9/D23) — overridable via OLLAMA_NUM_CTX / OLLAMA_NUM_PREDICT
+for an evaluator who wants to experiment, but the shipped defaults are the measured
+right-sizing for an 8 GB machine and should not normally need to change:
   _NUM_CTX     = 2048  (prompt ~700 tokens + 300 output; larger wastes KV cache)
   _NUM_PREDICT = 300
   _SEED        = 42    (combined with temperature=0 for byte-identical determinism)
@@ -107,10 +109,19 @@ class OllamaGenerator:
     These are documented in README.md run instructions.
     """
 
-    def __init__(self, host: str, model: str, keep_alive: str) -> None:
+    def __init__(
+        self,
+        host: str,
+        model: str,
+        keep_alive: str,
+        num_ctx: int = _NUM_CTX,
+        num_predict: int = _NUM_PREDICT,
+    ) -> None:
         self._host = host.rstrip("/")
         self._model = model
         self._keep_alive = keep_alive
+        self._num_ctx = num_ctx
+        self._num_predict = num_predict
 
     def __call__(
         self,
@@ -131,8 +142,8 @@ class OllamaGenerator:
             "options": {
                 "temperature": temperature,
                 "seed": _SEED,
-                "num_ctx": _NUM_CTX,
-                "num_predict": _NUM_PREDICT,
+                "num_ctx": self._num_ctx,
+                "num_predict": self._num_predict,
             },
             "keep_alive": self._keep_alive,
         }
@@ -150,6 +161,9 @@ class OllamaGenerator:
         except httpx.HTTPStatusError as exc:
             logger.error("Ollama returned HTTP %s: %s", exc.response.status_code, exc)
             raise ProviderError(f"Ollama HTTP error {exc.response.status_code}") from exc
+        except httpx.RequestError as exc:
+            logger.error("Ollama request failed: %s", exc)
+            raise ProviderError(f"Ollama request failed: {exc}") from exc
         except KeyError as exc:
             logger.error("Ollama response missing expected field: %s", exc)
             raise ProviderError(f"Unexpected Ollama response shape: missing field {exc}") from exc
@@ -187,6 +201,7 @@ class GroqGenerator:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
             "seed": _SEED,
+            "max_tokens": _NUM_PREDICT,
         }
         headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
@@ -204,6 +219,9 @@ class GroqGenerator:
         except httpx.HTTPStatusError as exc:
             logger.error("Groq returned HTTP %s: %s", exc.response.status_code, exc)
             raise ProviderError(f"Groq HTTP error {exc.response.status_code}") from exc
+        except httpx.RequestError as exc:
+            logger.error("Groq request failed: %s", exc)
+            raise ProviderError(f"Groq request failed: {exc}") from exc
         except (KeyError, IndexError) as exc:
             logger.error("Groq response missing expected field: %s", exc)
             raise ProviderError(f"Unexpected Groq response shape: {exc}") from exc
@@ -225,6 +243,8 @@ def make_generator() -> Generator:
             host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
             model=os.getenv("LLM_MODEL", "qwen2.5:3b"),
             keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "5m"),
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", str(_NUM_CTX))),
+            num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", str(_NUM_PREDICT))),
         )
     if provider == "groq":
         api_key = os.getenv("GROQ_API_KEY", "")

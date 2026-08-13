@@ -81,6 +81,22 @@ def test_ollama_generate_timeout_raises_provider_error() -> None:
             gen("prompt")
 
 
+def test_ollama_generate_connect_error_raises_provider_error() -> None:
+    """Connection refused (daemon not running) is wrapped in ProviderError, not left to propagate.
+
+    httpx.ConnectError is a sibling of TimeoutException under RequestError, not a
+    subclass of it — this is the most likely real-world failure (host Ollama daemon
+    down) and must degrade to the grounding contract's refusal shape, not a 500.
+    """
+    with patch(
+        "httpx.post",
+        side_effect=httpx.ConnectError("connection refused", request=MagicMock()),
+    ):
+        gen = OllamaGenerator(host="http://localhost:11434", model="qwen2.5:3b", keep_alive="5m")
+        with pytest.raises(ProviderError):
+            gen("prompt")
+
+
 def test_ollama_generate_http_error_raises_provider_error() -> None:
     """Non-2xx HTTP response from Ollama is wrapped in ProviderError."""
     mock_resp = MagicMock(spec=httpx.Response)
@@ -135,6 +151,17 @@ def test_groq_generate_http_error_raises_provider_error() -> None:
             gen("prompt")
 
 
+def test_groq_generate_connect_error_raises_provider_error() -> None:
+    """Connection failure to Groq is wrapped in ProviderError, not left to propagate."""
+    with patch(
+        "httpx.post",
+        side_effect=httpx.ConnectError("connection refused", request=MagicMock()),
+    ):
+        gen = GroqGenerator(api_key="test-key-123", model="llama-3.1-8b-instant")
+        with pytest.raises(ProviderError):
+            gen("prompt")
+
+
 # -- make_generator ------------------------------------------------------------
 
 
@@ -156,6 +183,17 @@ def test_make_generator_ollama_reads_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert gen._host == "http://remote:11434"
     assert gen._model == "llama3.2:3b"
     assert gen._keep_alive == "0"
+
+
+def test_make_generator_ollama_reads_num_ctx_and_predict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OLLAMA_NUM_CTX / OLLAMA_NUM_PREDICT override the measured defaults."""
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "4096")
+    monkeypatch.setenv("OLLAMA_NUM_PREDICT", "512")
+    gen = make_generator()
+    assert isinstance(gen, OllamaGenerator)
+    assert gen._num_ctx == 4096
+    assert gen._num_predict == 512
 
 
 def test_make_generator_groq_missing_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:

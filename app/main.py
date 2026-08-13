@@ -1,5 +1,6 @@
 """FastAPI application — POST /ask and static UI."""
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncGenerator
@@ -123,6 +124,11 @@ def _assert_chunks_valid(chunks: list[Chunk], pdf_paths: list[Path]) -> None:
     or incomplete data.  parse_pdf already validates each document individually;
     this aggregates across all documents.
     """
+    if not pdf_paths:
+        raise RuntimeError(
+            f"Startup assertion failed: no PDFs found in {DOCS_DIR}.  "
+            "Check that docs/ is mounted/populated."
+        )
     expected_total = len(pdf_paths) * _CHUNKS_PER_DOC
     if len(chunks) != expected_total:
         raise RuntimeError(
@@ -277,7 +283,9 @@ async def ask(
     )
 
     try:
-        raw = generator(prompt, temperature=0.0)
+        # generator() is a synchronous httpx call (up to `timeout` seconds); run it off
+        # the event loop so a slow/hung provider doesn't stall other in-flight requests.
+        raw = await asyncio.to_thread(generator, prompt, temperature=0.0)
     except ProviderError as exc:
         logger.error("LLM provider error — returning refusal: %s", exc)
         return AskResponse(answer=REFUSAL_MESSAGE, citations=[])
