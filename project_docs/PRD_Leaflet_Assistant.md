@@ -22,9 +22,9 @@ the leaflet has no such section, is actively harmful. Staff cannot tell the
 difference between a grounded answer and a fluent invention.
 
 Compounding this, the leaflets are structurally near-identical. Storage
-instructions across products are effectively boilerplate (measured 0.82 mean
-cosine similarity between different products' storage sections — pending re-run
-over the fifth document), and **22 of 30** sections never name their own product
+instructions across products are effectively boilerplate (measured 0.61 mean
+cosine similarity between different products' storage sections, over all five
+leaflets), and **22 of 30** sections never name their own product
 in the body text. A naive retrieval system will confidently answer a question
 about one medicine using another medicine's leaflet.
 
@@ -389,8 +389,9 @@ under a gigabyte.)*
 
 **Document count resolved.** All five leaflets are present. Counts and section
 statistics have been re-measured over all five; the cross-document similarity
-table is the one remaining figure still quoted from the four-document
-measurement and must be re-run before it is published.
+table has now been re-measured over all five documents via
+`scripts/measure_similarity.py` — all documentation reflects the five-document
+figures.
 
 **Two decisions carry explicit kill criteria** — the dual embedding and hybrid
 retrieval. Both are measured against their simpler baseline, and either is

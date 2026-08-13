@@ -64,18 +64,17 @@ Nothing needs splitting. 35 chunks × 384 dims = **53 KB of float32** — the
 entire corpus fits in a numpy array smaller than this document.
 
 **Cross-document collision is the real risk.** Same-section, different-drug
-TF-IDF cosine — ⚠️ **measured over 4 documents; MUST be re-run over 5** before
-any of these numbers appears in `DESIGN.md`. A fifth §6 chunk (Fenadin's, two
-lines of near-boilerplate) enters exactly the worst-colliding cluster:
+TF-IDF cosine — measured over all 5 documents (`scripts/measure_similarity.py`,
+sklearn-compatible smooth IDF, L2-normalised, C(5,2)=10 pairs per section):
 
 | Section | avg | worst |
 |---|---|---|
-| §6 How to store | **0.82** | 0.85 (doxicap vs rolac) |
-| §3 How to take | 0.41 | 0.56 (maxpro vs rolip) |
-| §5 Pregnancy | 0.15 | 0.19 |
-| §2 Before you take | 0.14 | 0.37 |
-| §4 Side effects | 0.12 | 0.30 |
-| §1 What it is | 0.04 | 0.06 |
+| §6 How to store | **0.61** | 1.00 (fenadin vs rolac) |
+| §3 How to take | 0.32 | 0.50 (fenadin vs rolip) |
+| §2 Before you take | 0.30 | 0.39 (doxicap vs rolac) |
+| §5 Pregnancy | 0.18 | 0.32 (fenadin vs rolac) |
+| §1 What it is | 0.13 | 0.27 (fenadin vs maxpro) |
+| §4 Side effects | 0.12 | 0.21 (maxpro vs rolip) |
 
 All five worst-colliding pairs in the corpus are §6 vs §6. Storage instructions
 are near-boilerplate across products. Dense embeddings will collapse these
@@ -410,7 +409,7 @@ already anticipated in §6 — built rather than improvised under pressure.
 
 When no product is named, every disambiguation mechanism is inert at once — D13
 does not fire, BM25 has no brand token, and D3's headers have nothing to match.
-"How should I store this?" then resolves on §6, the 0.82 collision cluster, and
+"How should I store this?" then resolves on §6, the 0.61 avg collision cluster, and
 answers about a coin-flip product.
 
 **Chosen:** a prompt rule — if retrieved chunks span more than one product,
@@ -661,9 +660,11 @@ Applies to leaflet text, eval output, `.env` loading, and every JSON artifact.
 - [x] ~~Decide fallback if a document doesn't match the 1–6 heading scheme~~ —
       **fail loudly** (user story 34); a startup assertion on chunk count and
       section coverage per document.
-- [ ] **Re-run the TF-IDF collision table over 5 documents.** The 0.82 / 0.56
-      figures are the only stale numbers left, and they are quoted three times
-      across the docs. Requires `scikit-learn`, which is not currently installed.
+- [x] **Re-run the TF-IDF collision table over 5 documents.** Done — see
+      `scripts/measure_similarity.py`. Updated figures: §6 avg 0.61 (worst 1.00
+      fenadin=rolac identical text), §3 avg 0.32 (worst 0.50 fenadin vs rolip).
+      Implemented with numpy smooth IDF (no scikit-learn dep needed). All three
+      docs updated.
 - [ ] Measure τ separation, both single-vector and dual-embed (D6 kill criterion).
 - [ ] Measure retrieval accuracy with headers off/on and hybrid off/on, with D13
       **off** — DESIGN.md §3 needs a real impact number, not an assertion (D16).
