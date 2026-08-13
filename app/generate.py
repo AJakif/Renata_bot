@@ -139,6 +139,10 @@ class OllamaGenerator:
             "model": self._model,
             "prompt": prompt,
             "stream": False,
+            # Constrain decoding to the GenerationResult JSON schema (D24).
+            # Ollama 0.5+ supports a full JSON schema object here; older builds
+            # fall back to valid-JSON-only mode when given the string "json".
+            "format": GenerationResult.model_json_schema(),
             "options": {
                 "temperature": temperature,
                 "seed": _SEED,

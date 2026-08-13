@@ -289,3 +289,42 @@ def test_no_negative_scores(
         assert all(s >= 0.0 for s in scores), (
             f"Negative score(s) with use_dual_embedding={use_dual}: {scores}"
         )
+
+
+# -- Fix 3 regression: cosine scores are clamped to [0, 1] --------------------
+
+
+def test_score_clamped_when_distance_exceeds_one() -> None:
+    """ChunkResult.score must be clamped to [0, 1] even when ChromaDB returns dist > 1.
+
+    In cosine space, distance = 1 - similarity and similarity ∈ [-1, 1], so
+    Chroma can legitimately return dist > 1 for dissimilar/opposite vectors.
+    Before the fix, score = round(1.0 - dist, 6) went negative (e.g. -0.5 for
+    dist=1.5), violating the docstring's [0, 1] invariant and the gate threshold
+    comparison.  After the fix, score = max(0.0, min(1.0, 1.0 - dist)).
+    """
+    from unittest.mock import MagicMock
+
+    mock_collection = MagicMock()
+    # dist=1.5 → unclamped score = -0.5; clamped score = 0.0
+    mock_collection.query.return_value = {
+        "documents": [[_STORE_BODY]],
+        "metadatas": [[{"source": _PRODUCT_A, "section": "How to store"}]],
+        "distances": [[1.5]],
+    }
+    mock_collection.count.return_value = 1
+
+    results = retrieve(
+        "some query",
+        mock_collection,
+        top_k=1,
+        use_hybrid=False,
+        use_dual_embedding=False,
+    )
+    assert results, "Expected at least one result from mocked collection"
+    assert results[0].score >= 0.0, (
+        f"Score must be clamped to ≥0 when dist > 1; got {results[0].score}"
+    )
+    assert results[0].score <= 1.0, (
+        f"Score must be clamped to ≤1; got {results[0].score}"
+    )
