@@ -8,6 +8,29 @@ Grounded RAG service over Renata medicine leaflets. `POST /ask` → answer + cit
 - No system binaries required — PDF parsing uses `pypdf` (pure Python)
 - Ollama 0.32+ with `qwen2.5:3b` pulled (`ollama pull qwen2.5:3b`), **or** a Groq API key
 
+## Models used
+
+- **Embeddings:** `all-MiniLM-L6-v2` (ONNX build via ChromaDB) — local, CPU, no API key.
+- **Generation:** `qwen2.5:3b` via Ollama by default (local); `LLM_PROVIDER=groq` switches to a
+  hosted Groq model (e.g. `llama-3.1-8b-instant`) as a zero-install alternative. See
+  `project_docs/DESIGN.md` §5 for the model comparison behind this choice.
+
+## Source documents
+
+The corpus is 5 medicine leaflet PDFs in `docs/`, each parsed into one chunk per
+numbered section (see `project_docs/DESIGN.md` §2 for the chunking strategy):
+
+| File | Brand | Active ingredient |
+|---|---|---|
+| `docs/doxicap_100mg_doxycycline_leaflet.pdf` | Doxicap | Doxycycline 100mg |
+| `docs/fenadin_120mg_fexofenadine_leaflet.pdf` | Fenadin | Fexofenadine 120mg |
+| `docs/maxpro_20mg_esomeprazole_leaflet.pdf` | Maxpro | Esomeprazole 20mg |
+| `docs/rolac_10mg_ketorolac_leaflet.pdf` | Rolac | Ketorolac 10mg |
+| `docs/rolip_10mg_rosuvastatin_leaflet.pdf` | Rolip | Rosuvastatin 10mg |
+
+Adding a leaflet is a drop-in: place the PDF in `docs/` and restart — no code
+change (see "Add a new leaflet" below).
+
 ## Setup
 
 ```bash
@@ -107,6 +130,9 @@ Then in a second terminal:
 ```bash
 uvicorn app.main:app --reload
 ```
+
+Open the chat UI at `http://localhost:8000/` (the API is at the same origin,
+`POST http://localhost:8000/ask`).
 
 The service picks up `LLM_PROVIDER`, `LLM_MODEL`, `OLLAMA_HOST`, and `OLLAMA_KEEP_ALIVE` from `.env`
 (defaults: `ollama`, `qwen2.5:3b`, `http://localhost:11434`, `5m`).
